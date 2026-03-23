@@ -22,7 +22,10 @@ try {
 
     $cursor = $db->budget_requests->find(
         ['piEmail' => $piEmail],
-        ['sort' => ['createdAt' => -1]]
+        [
+            'projection' => ['quotation' => 0], // Exclude heavy base64 data to prevent 502 crashes
+            'sort' => ['createdAt' => -1]
+        ]
     );
 
     $stageLabels = [
