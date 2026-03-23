@@ -5,7 +5,7 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     git \
     unzip \
-    && pecl install mongodb \
+    && pecl install mongodb-1.17.0 \
     && docker-php-ext-enable mongodb
 
 # Install Composer globally
