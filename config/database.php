@@ -1,11 +1,11 @@
 <?php
-require_once __DIR__ . '/../../vendor/autoload.php';
+require_once __DIR__ . '/../vendor/autoload.php';
 
 use MongoDB\Client;
 use Dotenv\Dotenv;
 
-// Load .env from backend parent root
-$dotenv = Dotenv::createImmutable(dirname(dirname(__DIR__)));
+// Load .env from project root
+$dotenv = Dotenv::createImmutable(dirname(__DIR__));
 $dotenv->load();
 
 
