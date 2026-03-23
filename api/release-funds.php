@@ -9,37 +9,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit();
 }
 
-$possiblePaths = [
-    __DIR__ . '/../vendor/autoload.php',
-    __DIR__ . '/../../vendor/autoload.php',
-    __DIR__ . '/vendor/autoload.php',
-];
+require_once __DIR__ . '/../config/database.php';
 
-$vendorLoaded = false;
-foreach ($possiblePaths as $path) {
-    if (file_exists($path)) {
-        require_once $path;
-        $vendorLoaded = true;
-        break;
-    }
-}
-
-if (!$vendorLoaded) {
-    http_response_code(500);
-    echo json_encode([
-        'success' => false,
-        'message' => 'MongoDB library not found. Please run: composer require mongodb/mongodb'
-    ]);
-    exit();
-}
-
-use MongoDB\Client;
 use MongoDB\BSON\ObjectId;
 use MongoDB\BSON\UTCDateTime;
 
 try {
-    $client = new Client("mongodb+srv://vaaditahira_db_user:X9xd8FRkedqnFb0g@cluster0.kkaiv8w.mongodb.net/?appName=Cluster0");
-    $db = $client->research_projects;
+    $db = getMongoDBConnection();
+    if (!$db) throw new Exception('Failed to connect to MongoDB');
+
     $releasedFundsCollection = $db->released_funds;
     $budgetRequestsCollection = $db->budget_requests;
     $projectsCollection = $db->projects;
