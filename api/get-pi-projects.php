@@ -20,10 +20,9 @@ if (empty($piEmail)) {
 try {
     $db = getMongoDBConnection();
 
-    // ── Fetch all projects for this PI that have released funds ───────────────
+    // ── Fetch all active projects for this PI ───────────────
     $cursor = $db->projects->find([
         'piEmail'             => $piEmail,
-        'totalReleasedAmount' => ['$gt' => 0],
         'status'              => ['$nin' => ['rejected', 'completed']],
     ]);
 
