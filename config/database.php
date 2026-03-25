@@ -10,9 +10,10 @@ require_once __DIR__ . '/../vendor/autoload.php';
 use MongoDB\Client;
 use Dotenv\Dotenv;
 
-// Load .env from project root
+// Use safeLoad() so it doesn't crash when .env doesn't exist (e.g. on Render).
+// Render sets environment variables natively; getenv() will pick them up.
 $dotenv = Dotenv::createImmutable(dirname(__DIR__));
-$dotenv->load();
+$dotenv->safeLoad();
 
 
 class Database {
@@ -22,8 +23,9 @@ class Database {
     private $client;
 
     public function __construct() {
-        $this->atlas_uri = $_ENV['MONGODB_ATLAS_URI'] ?? '';
-        $this->db_name   = $_ENV['MONGODB_DB_NAME'] ?? 'research_projects';
+        // $_ENV is populated by Dotenv; getenv() picks up Render's native env vars when .env is absent
+        $this->atlas_uri = $_ENV['MONGODB_ATLAS_URI'] ?? getenv('MONGODB_ATLAS_URI') ?: '';
+        $this->db_name   = $_ENV['MONGODB_DB_NAME']   ?? getenv('MONGODB_DB_NAME')   ?: 'research_projects';
         $this->connect();
     }
 
