@@ -11,6 +11,18 @@ require_once __DIR__ . '/../config/database.php';
 if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
     echo json_encode(['success' => false, 'message' => 'Method not allowed']); exit();
 }
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Methods: GET, OPTIONS');
+header('Access-Control-Allow-Headers: Content-Type, Authorization');
+header('Content-Type: application/json');
+
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit(); }
+
+require_once __DIR__ . '/../config/database.php';
+
+if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
+    echo json_encode(['success' => false, 'message' => 'Method not allowed']); exit();
+}
 
 $piEmail = $_GET['piEmail'] ?? '';
 if (empty($piEmail)) {
@@ -18,106 +30,91 @@ if (empty($piEmail)) {
 }
 
 try {
-    $db = getMongoDBConnection();
+    $db = getMySQLConnection();
 
-    // ── Fetch all active projects for this PI ───────────────
-    $cursor = $db->projects->find([
-        'piEmail' => $piEmail,
-        'status'  => ['$nin' => ['rejected', 'completed']],
-    ], ['projection' => ['sanctionedLetterFile' => 0]]);
-    $projectsRaw = iterator_to_array($cursor);
-    $projectIds  = array_map(fn($p) => (string)$p['_id'], $projectsRaw);
-
-    if (empty($projectIds)) {
+    // ── 1. Fetch all active projects for this PI ───────────────
+    $stmt = $db->prepare("SELECT * FROM projects WHERE piEmail = ? AND status NOT IN ('rejected', 'completed')");
+    $stmt->execute([$piEmail]);
+    $projectsRaw = $stmt->fetchAll();
+    
+    if (empty($projectsRaw)) {
         echo json_encode(['success' => true, 'data' => [], 'count' => 0]);
         exit();
     }
 
-    // ── 1. Batch Aggregation for Project Totals ──────────────────────────
-    // booked = SUM of requestedAmount for ALL non-rejected requests (pending + approved)
-    // actual = SUM of actualExpenditure for approved requests only
-    $projectBookingPipeline = [
-        ['$match' => ['projectId' => ['$in' => $projectIds]]],
-        ['$group' => [
-            '_id'    => '$projectId',
-            'booked' => ['$sum' => [
-                '$cond' => [['$ne' => ['$status', 'rejected']], '$requestedAmount', 0]
-            ]],
-            'actual' => ['$sum' => [
-                '$cond' => [['$eq' => ['$status', 'approved']], '$actualExpenditure', 0]
-            ]]
-        ]]
-    ];
-    $projectTotalsRaw = iterator_to_array($db->budget_requests->aggregate($projectBookingPipeline));
-    $projectTotals    = [];
-    foreach ($projectTotalsRaw as $pt) { $projectTotals[$pt['_id']] = $pt; }
+    $projectIds = array_map(fn($p) => $p['id'], $projectsRaw);
+    $placeholders = implode(',', array_fill(0, count($projectIds), '?'));
 
-    // ── 2. Batch Aggregation for Head Totals ────────────────────────────
-    // Same rule: booked excludes rejected, actual is approved only
-    $headBookingPipeline = [
-        ['$match' => ['projectId' => ['$in' => $projectIds]]],
-        ['$group' => [
-            '_id' => [
-                'projectId' => '$projectId',
-                'headId'    => '$headId',
-                'headName'  => '$headName'
-            ],
-            'booked' => ['$sum' => [
-                '$cond' => [['$ne' => ['$status', 'rejected']], '$requestedAmount', 0]
-            ]],
-            'actual' => ['$sum' => [
-                '$cond' => [['$eq' => ['$status', 'approved']], '$actualExpenditure', 0]
-            ]]
-        ]]
-    ];
-    $headTotalsRaw = iterator_to_array($db->budget_requests->aggregate($headBookingPipeline));
-    $headTotals    = [];
-    foreach ($headTotalsRaw as $ht) {
-        $key = $ht['_id']['projectId'] . '|' . ($ht['_id']['headId'] ?: $ht['_id']['headName']);
-        $headTotals[$key] = $ht;
+    // ── 2. Fetch all budget requests for these projects to calculate totals in PHP ──────────
+    $sqlRequests = "SELECT projectId, status, requestedAmount, actual_exp 
+                    FROM budget_requests 
+                    WHERE projectId IN ($placeholders)";
+    $stmtR = $db->prepare($sqlRequests);
+    $stmtR->execute($projectIds);
+    $allRequests = $stmtR->fetchAll();
+
+    $projectTotals = [];
+    $headTotals = [];
+    foreach ($allRequests as $req) {
+        $pid = $req['projectId'];
+        if (!isset($projectTotals[$pid])) $projectTotals[$pid] = ['booked' => 0, 'actual' => 0];
+        
+        if ($req['status'] !== 'rejected') {
+            $projectTotals[$pid]['booked'] += floatval($req['requestedAmount']);
+        }
+        if ($req['status'] === 'approved') {
+            $projectTotals[$pid]['actual'] += floatval($req['actual_exp']);
+        }
     }
 
-    // ── 3. Fetch Head Allocations in one go ──────────────────────────────
-    $headAllocsRaw    = iterator_to_array($db->head_allocations->find(['projectId' => ['$in' => $projectIds]]));
-    $allocsByProject  = [];
-    foreach ($headAllocsRaw as $ha) { $allocsByProject[(string)$ha['projectId']][] = $ha; }
+    // ── 3. Head Totals Calc ────────────────────────────
+    $sqlHeadReqs = "SELECT projectId, headId, headName, status, requestedAmount, actual_exp 
+                    FROM budget_requests 
+                    WHERE projectId IN ($placeholders)";
+    $stmtHTR = $db->prepare($sqlHeadReqs);
+    $stmtHTR->execute($projectIds);
+    $headReqs = $stmtHTR->fetchAll();
 
-    // ── 4. Main Process Loop ──────────────────────────────────────────────
-    $projects        = [];
-    $bulkOpsProject  = [];
-    $bulkOpsHeads    = [];
+    foreach ($headReqs as $hr) {
+        $hKey = $hr['projectId'] . '|' . ($hr['headId'] ?: $hr['headName']);
+        if (!isset($headTotals[$hKey])) $headTotals[$hKey] = ['booked' => 0, 'actual' => 0];
+
+        if ($hr['status'] !== 'rejected') {
+            $headTotals[$hKey]['booked'] += floatval($hr['requestedAmount']);
+        }
+        if ($hr['status'] === 'approved') {
+            $headTotals[$hKey]['actual'] += floatval($hr['actual_exp']);
+        }
+    }
+
+    // ── 4. Fetch Head Allocations ──────────────────────────────
+    $sqlAlloc = "SELECT * FROM head_allocations WHERE projectId IN ($placeholders)";
+    $stmtAlloc = $db->prepare($sqlAlloc);
+    $stmtAlloc->execute($projectIds);
+    $allocsByProject = [];
+    while ($ha = $stmtAlloc->fetch()) { $allocsByProject[$ha['projectId']][] = $ha; }
+
+    // ── 5. Main Process Loop ──────────────────────────────────────────────
+    $projects = [];
+    $now = date('Y-m-d H:i:s');
 
     foreach ($projectsRaw as $project) {
-        $projectId = (string)$project['_id'];
+        $projectId = $project['id'];
         $released  = floatval($project['totalReleasedAmount'] ?? 0);
         $booked    = floatval($projectTotals[$projectId]['booked'] ?? 0);
         $actual    = floatval($projectTotals[$projectId]['actual'] ?? 0);
 
-        // CORRECT FORMULA:
-        // available = released - booked
-        // "booked" already only counts non-rejected requests (pending + approved).
-        // When a request is rejected, its amount is removed from booked → available rises again.
-        // When approved, it stays in booked permanently (until actual expenditure is filled).
-        // There is NO "unusedBooking" add-back — that was the bug causing overcounting.
         $availableBalance = max(0.0, $released - $booked);
 
         // Sync denormalised project fields if they drifted
         if (abs($booked - floatval($project['amountBookedByPI'] ?? -1)) > 0.001
-            || abs($actual - floatval($project['actualExpenditure'] ?? -1)) > 0.001) {
-            $bulkOpsProject[] = [
-                'updateOne' => [
-                    ['_id' => $project['_id']],
-                    ['$set' => [
-                        'amountBookedByPI'  => $booked,
-                        'actualExpenditure' => $actual,
-                        'updatedAt'         => new MongoDB\BSON\UTCDateTime(),
-                    ]]
-                ]
-            ];
+            || abs($actual - floatval($project['actual_exp'] ?? -1)) > 0.001) {
+            $db->prepare("UPDATE projects SET amountBookedByPI = ?, actual_exp = ?, updatedAt = ? WHERE id = ?")
+               ->execute([$booked, $actual, $now, $projectId]);
         }
 
         // ── Heads ──────────────────────────────────────────────────────────
-        $heads        = [];
+        $heads = [];
         $projectHeads = $allocsByProject[$projectId] ?? [];
 
         foreach ($projectHeads as $alloc) {
@@ -129,47 +126,31 @@ try {
 
             $hKey1 = $projectId . '|' . $headId;
             $hKey2 = $projectId . '|' . $headName;
-            $ht    = $headTotals[$hKey1] ?? $headTotals[$hKey2] ?? ['booked' => 0, 'actual' => 0];
+            $ht = $headTotals[$hKey1] ?? $headTotals[$hKey2] ?? ['booked' => 0, 'actual' => 0];
 
             $headBooked = floatval($ht['booked']);
             $headActual = floatval($ht['actual']);
-
-            // CORRECT FORMULA (same rule as project level):
-            // available = released - booked  (rejected requests excluded from booked)
             $headAvail = max(0.0, $headReleased - $headBooked);
 
             // Sync head allocation document if drifted
             if (abs($headBooked - floatval($alloc['bookedAmount'] ?? -1)) > 0.001
-                || abs($headActual - floatval($alloc['actualExpenditure'] ?? -1)) > 0.001) {
-                $bulkOpsHeads[] = [
-                    'updateOne' => [
-                        ['_id' => $alloc['_id']],
-                        ['$set' => [
-                            'bookedAmount'      => $headBooked,
-                            'actualExpenditure' => $headActual,
-                            'updatedAt'         => new MongoDB\BSON\UTCDateTime(),
-                        ]]
-                    ]
-                ];
+                || abs($headActual - floatval($alloc['actual_exp'] ?? -1)) > 0.001) {
+                $db->prepare("UPDATE head_allocations SET bookedAmount = ?, actual_exp = ?, updatedAt = ? WHERE id = ?")
+                   ->execute([$headBooked, $headActual, $now, $alloc['id']]);
             }
 
             $heads[] = [
-                'id'                => (string)$alloc['_id'],
+                'id'                => $alloc['id'],
                 'headId'            => $headId,
                 'headName'          => $headName,
                 'headType'          => $alloc['headType'] ?? '',
                 'sanctionedAmount'  => floatval($alloc['sanctionedAmount'] ?? 0),
                 'releasedAmount'    => $headReleased,
-                'bookedAmount'      => $headBooked,   // live-computed from budget_requests
-                'actualExpenditure' => $headActual,
-                'availableBalance'  => $headAvail,    // = releasedAmount - bookedAmount
+                'bookedAmount'      => $headBooked,
+                'actual_exp' => $headActual,
+                'availableBalance'  => $headAvail,
             ];
         }
-
-        $formatDate = function ($val) {
-            if ($val instanceof MongoDB\BSON\UTCDateTime) return $val->toDateTime()->format('Y-m-d');
-            return $val ?? null;
-        };
 
         $projects[] = [
             'id'                    => $projectId,
@@ -179,21 +160,17 @@ try {
             'piName'                => $project['piName']        ?? '',
             'piEmail'               => $project['piEmail']       ?? '',
             'department'            => $project['department']    ?? '',
-            'projectStartDate'      => $formatDate($project['projectStartDate'] ?? null),
-            'projectEndDate'        => $formatDate($project['projectEndDate']   ?? null),
+            'projectStartDate'      => $project['projectStartDate'] ? date('Y-m-d', strtotime($project['projectStartDate'])) : null,
+            'projectEndDate'        => $project['projectEndDate'] ? date('Y-m-d', strtotime($project['projectEndDate'])) : null,
             'totalSanctionedAmount' => floatval($project['totalSanctionedAmount'] ?? 0),
             'totalReleasedAmount'   => $released,
-            'amountBookedByPI'      => $booked,            // live-computed
-            'actualExpenditure'     => $actual,
-            'availableBalance'      => $availableBalance,  // = released - booked
+            'amountBookedByPI'      => $booked,
+            'actual_exp'     => $actual,
+            'availableBalance'      => $availableBalance,
             'status'                => $project['status'] ?? 'active',
             'heads'                 => $heads,
         ];
     }
-
-    // ── 5. Bulk Sync ──────────────────────────────────────────────────────
-    if (!empty($bulkOpsProject)) { $db->projects->bulkWrite($bulkOpsProject); }
-    if (!empty($bulkOpsHeads))   { $db->head_allocations->bulkWrite($bulkOpsHeads); }
 
     echo json_encode(['success' => true, 'data' => $projects, 'count' => count($projects)]);
 

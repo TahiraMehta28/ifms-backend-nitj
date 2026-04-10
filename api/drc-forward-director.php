@@ -11,8 +11,12 @@ header('Content-Type: application/json');
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit(); }
 
-use MongoDB\BSON\ObjectId;
-use MongoDB\BSON\UTCDateTime;
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Methods: POST, OPTIONS');
+header('Access-Control-Allow-Headers: Content-Type, Authorization');
+header('Content-Type: application/json');
+
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit(); }
 
 require_once __DIR__ . '/../config/database.php';
 
@@ -30,11 +34,12 @@ if (!$requestId) {
 }
 
 try {
-    $db  = getMongoDBConnection();
-    $req = $db->budget_requests->findOne(
-        ['_id' => new ObjectId($requestId)],
-        ['projection' => ['quotation' => 0]]
-    );
+    $db = getMySQLConnection();
+
+    // 1. Fetch Request
+    $stmt = $db->prepare("SELECT * FROM budget_requests WHERE id = ?");
+    $stmt->execute([$requestId]);
+    $req = $stmt->fetch();
 
     if (!$req) {
         echo json_encode(['success' => false, 'message' => 'Request not found']); exit();
@@ -48,7 +53,7 @@ try {
         echo json_encode(['success' => false, 'message' => 'Invalid status for DRC forward action']); exit();
     }
 
-    // ✅ Read approvalType from the document (set by DR R&C — DRC cannot change it)
+    // 2. Read approvalType (set by DR R&C)
     $approvalType = trim((string)($req['approvalType'] ?? ''));
     $allowedApprovalTypes = ['admin', 'admin_cum_financial'];
 
@@ -59,33 +64,28 @@ try {
         ]); exit();
     }
 
-    $now     = new UTCDateTime();
-    $history = isset($req['approvalHistory']) ? iterator_to_array($req['approvalHistory']) : [];
-    $history[] = [
-        'stage'        => 'drc',
-        'action'       => 'forwarded',
-        'by'           => $by,
-        'timestamp'    => date('c'),
-        'remarks'      => $remarks,
-        'approvalType' => $approvalType, // record in history for audit trail
-    ];
+    $now = date('Y-m-d H:i:s');
+    $timestamp = date('c');
 
-    $db->budget_requests->updateOne(
-        ['_id' => new ObjectId($requestId)],
-        ['$set' => [
-            'status'         => 'drc_forwarded',
-            'currentStage'   => 'director',
-            'drcRemarks'     => $remarks,
-            'drcForwardedAt' => $now,
-            // approvalType is NOT updated here — it stays as set by DR (R&C)
-            'approvalHistory' => $history,
-            'updatedAt'       => $now,
-        ]]
-    );
+    $db->beginTransaction();
 
-    $approvalTypeLabel = $approvalType === 'admin'
-        ? 'Admin Approval'
-        : 'Admin cum Financial Approval';
+    // 3. Update Request
+    $updateStmt = $db->prepare("UPDATE budget_requests SET 
+                                 status = 'drc_forwarded', 
+                                 currentStage = 'director', 
+                                 drcRemarks = ?, 
+                                 updatedAt = ? 
+                               WHERE id = ?");
+    $updateStmt->execute([$remarks, $now, $requestId]);
+
+    // 4. Insert History
+    $histStmt = $db->prepare("INSERT INTO approval_history (requestId, stage, action, `by`, timestamp, remarks, approvalType) 
+                              VALUES (?, 'drc', 'forwarded', ?, ?, ?, ?)");
+    $histStmt->execute([$requestId, $by, $timestamp, $remarks, $approvalType]);
+
+    $db->commit();
+
+    $approvalTypeLabel = $approvalType === 'admin' ? 'Admin Approval' : 'Admin cum Financial Approval';
 
     echo json_encode([
         'success' => true,
@@ -98,6 +98,7 @@ try {
     ]);
 
 } catch (Exception $e) {
+    if (isset($db) && $db->inTransaction()) $db->rollBack();
     http_response_code(500);
     echo json_encode(['success' => false, 'message' => $e->getMessage()]);
 }

@@ -13,8 +13,6 @@ header('Content-Type: application/json');
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit(); }
 
-use MongoDB\BSON\ObjectId;
-use MongoDB\BSON\UTCDateTime;
 
 require_once __DIR__ . '/../config/database.php';
 
@@ -30,17 +28,11 @@ if (!$input) {
 $requestId     = trim($input['requestId']     ?? '');
 $piEmail       = trim($input['piEmail']       ?? '');
 $piResponse    = trim($input['piResponse']    ?? '');
-
-// ✅ All PI-editable purchase fields
 $purpose       = trim($input['purpose']       ?? '');
 $description   = trim($input['description']   ?? '');
 $invoiceNumber = trim($input['invoiceNumber'] ?? '');
-$material      = trim($input['material']      ?? ''); // ✅ PI can correct material/qty
-$mode          = trim($input['mode']          ?? ''); // ✅ PI can correct mode of procurement
-
-// ✅ expenditure is intentionally NOT accepted from PI — owned by AR/DR
-
-// New quotation file (optional)
+$material      = trim($input['material']      ?? '');
+$mode          = trim($input['mode']          ?? '');
 $newQuotation     = $input['newQuotation']     ?? '';
 $newQuotationName = trim($input['newQuotationName'] ?? '');
 
@@ -48,11 +40,12 @@ if (!$requestId)  { echo json_encode(['success' => false, 'message' => 'requestI
 if (!$piResponse) { echo json_encode(['success' => false, 'message' => 'piResponse required']); exit(); }
 
 try {
-    $db  = getMongoDBConnection();
-    $req = $db->budget_requests->findOne(
-        ['_id' => new \MongoDB\BSON\ObjectId($requestId)],
-        ['projection' => ['quotation' => 0]]
-    );
+    $db = getMySQLConnection();
+    
+    // Fetch request metadata
+    $stmt = $db->prepare("SELECT status, currentStage, previousStatus, piEmail, gpNumber, fileNumber, hasOpenQuery FROM budget_requests WHERE id = ?");
+    $stmt->execute([$requestId]);
+    $req = $stmt->fetch();
 
     if (!$req) {
         echo json_encode(['success' => false, 'message' => 'Request not found']); exit();
@@ -60,103 +53,69 @@ try {
     if (!$req['hasOpenQuery'] && $req['status'] !== 'query_raised') {
         echo json_encode(['success' => false, 'message' => 'No open query on this request']); exit();
     }
-    if ($piEmail && (string)($req['piEmail'] ?? '') !== $piEmail) {
+    if ($piEmail && $req['piEmail'] !== $piEmail) {
         echo json_encode(['success' => false, 'message' => 'Unauthorized']); exit();
     }
 
-    // ── Always use the EXISTING file number from DB — never change it ─────
-    $existingFileNumber = (string)($req['fileNumber'] ?? '');
+    $db->beginTransaction();
 
-    $now = new \MongoDB\BSON\UTCDateTime();
+    $now = date('Y-m-d H:i:s');
+    $restoredStatus = !empty($req['previousStatus']) ? $req['previousStatus'] : 'pending';
+    
+    // 1. Update budget_requests
+    $updateSql = "UPDATE budget_requests 
+                  SET status = ?, 
+                      previousStatus = NULL, 
+                      hasOpenQuery = 0, 
+                      piResponse = ?, 
+                      updatedAt = ?";
+    $params = [$restoredStatus, $piResponse, $now];
 
-    // ── Restore status ────────────────────────────────────────────────────
-    $restoredStatus = !empty($req['previousStatus']) ? (string)$req['previousStatus'] : 'pending';
+    if (!empty($purpose)) { $updateSql .= ", purpose = ?"; $params[] = $purpose; }
+    if (!empty($description)) { $updateSql .= ", description = ?"; $params[] = $description; }
+    if (!empty($invoiceNumber)) { $updateSql .= ", invoiceNumber = ?"; $params[] = $invoiceNumber; }
+    if (!empty($material)) { $updateSql .= ", material = ?"; $params[] = $material; }
+    if (!empty($mode)) { $updateSql .= ", mode = ?"; $params[] = $mode; }
 
-    // ── Build approval history entry ──────────────────────────────────────
-    $history = isset($req['approvalHistory']) ? iterator_to_array($req['approvalHistory']) : [];
-    $history[] = [
-        'stage'     => (string)($req['currentStage'] ?? 'pi'),
-        'action'    => 'query_resolved',
-        'by'        => $piEmail ?: 'pi',
-        'timestamp' => date('c'),
-        'remarks'   => $piResponse,
-    ];
-
-    // ── Mark latestQuery resolved ─────────────────────────────────────────
-    $latestQuery = isset($req['latestQuery']) ? (array)$req['latestQuery'] : [];
-    $latestQuery['resolved']   = true;
-    $latestQuery['resolvedAt'] = date('c');
-    $latestQuery['piResponse'] = $piResponse;
-
-    // ── Mark all open queries resolved ────────────────────────────────────
-    $queries = [];
-    if (!empty($req['queries'])) {
-        foreach ($req['queries'] as $q) {
-            $q = is_array($q) ? $q : (array)$q;
-            if (!($q['resolved'] ?? false)) {
-                $q['resolved']   = true;
-                $q['resolvedAt'] = date('c');
-                $q['piResponse'] = $piResponse;
-            }
-            $queries[] = $q;
-        }
-    }
-
-    // ── Base $set fields ──────────────────────────────────────────────────
-    $setFields = [
-        'status'          => $restoredStatus,
-        'previousStatus'  => '',
-        'hasOpenQuery'    => false,
-        'latestQuery'     => $latestQuery,
-        'queries'         => $queries,
-        'approvalHistory' => $history,
-        'piResponse'      => $piResponse,
-        'updatedAt'       => $now,
-    ];
-
-    // ── Only update fields that were actually sent (non-empty) ────────────
-    if (!empty($purpose))       $setFields['purpose']       = htmlspecialchars(strip_tags($purpose));
-    if (!empty($description))   $setFields['description']   = htmlspecialchars(strip_tags($description));
-    if (!empty($invoiceNumber)) $setFields['invoiceNumber']  = htmlspecialchars(strip_tags($invoiceNumber));
-    if (!empty($material))      $setFields['material']       = htmlspecialchars(strip_tags($material));
-    if (!empty($mode))          $setFields['mode']           = htmlspecialchars(strip_tags($mode));
-
-    // ── NEW QUOTATION: update file content only, keep fileNumber unchanged ─
     if (!empty($newQuotation)) {
-        $setFields['quotation'] = $newQuotation;
-
-        // Build a descriptive filename using existing file number
-        $safeGp  = preg_replace('/[^a-zA-Z0-9_\-\/]/', '_', $req['gpNumber'] ?? '');
-        $safeFN  = preg_replace('/[^a-zA-Z0-9_\-\/]/', '_', $existingFileNumber);
-        $safeInv = preg_replace('/[^a-zA-Z0-9_-]/', '_', $invoiceNumber ?: (string)($req['invoiceNumber'] ?? ''));
-        $generatedName = "Quotation_{$safeGp}_{$safeFN}";
-        if ($safeInv) $generatedName .= "_{$safeInv}";
-        $generatedName .= ".pdf";
-
-        $setFields['quotationFileName'] = $newQuotationName ?: $generatedName;
-        // ✅ fileNumber is NOT in $setFields — DB value is preserved automatically
+        $updateSql .= ", quotation = ?, quotationFileName = ?";
+        $params[] = $newQuotation;
+        
+        $safeGp = preg_replace('/[^a-zA-Z0-9_\-]/', '_', $req['gpNumber']);
+        $safeFN = preg_replace('/[^a-zA-Z0-9_\-]/', '_', $req['fileNumber']);
+        $generatedName = "Quotation_Resubmitted_{$safeGp}_{$safeFN}.pdf";
+        $params[] = $newQuotationName ?: $generatedName;
     }
 
-    $db->budget_requests->updateOne(
-        ['_id' => new \MongoDB\BSON\ObjectId($requestId)],
-        ['$set' => $setFields]
-    );
+    $updateSql .= " WHERE id = ?";
+    $params[] = $requestId;
+    
+    $db->prepare($updateSql)->execute($params);
 
-    $message = !empty($newQuotation)
-        ? "Query resolved. New quotation uploaded. File number {$existingFileNumber} retained. Returned to reviewer."
-        : "Query resolved. Response submitted. Request returned to reviewer.";
+    // 2. Mark queries as resolved
+    $sqlResolved = "UPDATE budget_request_queries 
+                    SET resolved = 1, piResponse = ?, resolvedAt = ? 
+                    WHERE requestId = ? AND resolved = 0";
+    $db->prepare($sqlResolved)->execute([$piResponse, $now, $requestId]);
+
+    // 3. Add to history
+    $sqlHist = "INSERT INTO approval_history (requestId, stage, action, `by`, remarks, timestamp, approvalType) 
+                VALUES (?, ?, 'query_resolved', ?, ?, ?, NULL)";
+    $db->prepare($sqlHist)->execute([
+        $requestId, $req['currentStage'], $piEmail ?: 'pi', $piResponse, $now
+    ]);
+
+    $db->commit();
 
     echo json_encode([
         'success' => true,
-        'message' => $message,
-        'data'    => [
-            'status'         => $restoredStatus,
-            'fileNumber'     => $existingFileNumber,
-            'newFileUploaded'=> !empty($newQuotation),
-        ],
+        'message' => "Query resolved. Response submitted. Request returned to reviewer.",
+        'data'    => ['status' => $restoredStatus, 'currentStage' => $req['currentStage']],
     ]);
 
 } catch (Exception $e) {
+    if (isset($db) && $db->inTransaction()) $db->rollBack();
+    error_log("resolve-query error: " . $e->getMessage());
     http_response_code(500);
     echo json_encode(['success' => false, 'message' => $e->getMessage()]);
 }

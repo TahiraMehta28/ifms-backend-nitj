@@ -11,8 +11,7 @@ header('Content-Type: application/json');
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit(); }
 
 require_once __DIR__ . '/../config/database.php';
-use MongoDB\BSON\ObjectId;
-use MongoDB\BSON\UTCDateTime;
+require_once __DIR__ . '/../models/Project.php';
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     echo json_encode(['success' => false, 'message' => 'Method not allowed']); exit();
@@ -42,7 +41,7 @@ $stageStatusMap = [
     'director'   => ['drc_forwarded'],
 ];
 
-// Stage → field to store the rejection remarks in
+// Stage → field in budget_requests to store the remarks in
 $remarkField = [
     'da'         => 'daRemarks',
     'ar'         => 'arRemarks',
@@ -58,11 +57,12 @@ if (!array_key_exists($stage, $stageStatusMap)) {
 }
 
 try {
-    $db  = getMongoDBConnection();
-    $req = $db->budget_requests->findOne(
-        ['_id' => new \MongoDB\BSON\ObjectId($requestId)],
-        ['projection' => ['quotation' => 0]]
-    );
+    $db = getMySQLConnection();
+    
+    // Fetch request metadata
+    $stmt = $db->prepare("SELECT projectId, status, currentStage FROM budget_requests WHERE id = ?");
+    $stmt->execute([$requestId]);
+    $req = $stmt->fetch();
 
     if (!$req) {
         echo json_encode(['success' => false, 'message' => 'Request not found']); exit();
@@ -74,35 +74,38 @@ try {
         echo json_encode(['success' => false, 'message' => 'Cannot reject an approved request']); exit();
     }
     if ($req['currentStage'] !== $stage) {
-        echo json_encode(['success' => false, 'message' => "Request is not at $stage stage"]); exit();
+        echo json_encode(['success' => false, 'message' => "Request is at stage '{$req['currentStage']}', not '{$stage}'"]); exit();
     }
     if (!in_array($req['status'], $stageStatusMap[$stage])) {
         echo json_encode(['success' => false, 'message' => "Invalid status '{$req['status']}' for rejection at $stage"]); exit();
     }
 
-    $now     = new \MongoDB\BSON\UTCDateTime();
-    $history = isset($req['approvalHistory']) ? iterator_to_array($req['approvalHistory']) : [];
-    $history[] = [
-        'stage'     => $stage,
-        'action'    => 'rejected',
-        'by'        => $rejectedBy,
-        'timestamp' => date('c'),
-        'remarks'   => $remarks,
-    ];
+    $db->beginTransaction();
 
-    $db->budget_requests->updateOne(
-        ['_id' => new \MongoDB\BSON\ObjectId($requestId)],
-        ['$set' => [
-            'status'                  => 'rejected',
-            'currentStage'            => $stage,
-            $remarkField[$stage]      => $remarks,
-            'rejectedAt'              => $now,
-            'rejectedBy'              => $rejectedBy,
-            'rejectedAtStage'         => $stage,
-            'approvalHistory'         => $history,
-            'updatedAt'               => $now,
-        ]]
-    );
+    $now = date('Y-m-d H:i:s');
+    $column = $remarkField[$stage];
+
+    // 1. Update request status
+    $sql = "UPDATE budget_requests 
+            SET status = 'rejected', 
+                $column = ?, 
+                rejectedBy = ?, 
+                rejectedAtStage = ?, 
+                updatedAt = ? 
+            WHERE id = ?";
+    $stmtUpdate = $db->prepare($sql);
+    $stmtUpdate->execute([$remarks, $rejectedBy, $stage, $now, $requestId]);
+
+    // 2. Add to approval history
+    $sqlHist = "INSERT INTO approval_history (requestId, stage, action, `by`, remarks, timestamp) 
+                VALUES (?, ?, 'rejected', ?, ?, ?)";
+    $db->prepare($sqlHist)->execute([$requestId, $stage, $rejectedBy, $remarks, $now]);
+
+    $db->commit();
+
+    // 3. Sync project totals (after commit to ensure query finds the new 'rejected' status)
+    $projectModel = new Project($db);
+    $projectModel->syncFinancialTotals($req['projectId']);
 
     echo json_encode([
         'success' => true,
@@ -111,6 +114,8 @@ try {
     ]);
 
 } catch (Exception $e) {
+    if (isset($db) && $db->inTransaction()) $db->rollBack();
+    error_log("reject-request error: " . $e->getMessage());
     http_response_code(500);
     echo json_encode(['success' => false, 'message' => $e->getMessage()]);
 }

@@ -12,10 +12,9 @@ header('Content-Type: application/json');
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit(); }
 
-use MongoDB\BSON\ObjectId;
-use MongoDB\BSON\UTCDateTime;
-
 require_once __DIR__ . '/../config/database.php';
+
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit(); }
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     echo json_encode(['success' => false, 'message' => 'Method not allowed']); exit();
@@ -34,70 +33,65 @@ if (empty($remarks)) {
 }
 
 try {
-    $db  = getMongoDBConnection();
-    $req = $db->budget_requests->findOne(
-        ['_id' => new ObjectId($requestId)],
-        ['projection' => ['quotation' => 0]]
-    );
+    $db = getMySQLConnection();
+    $db->beginTransaction();
 
-    if (!$req) {
-        echo json_encode(['success' => false, 'message' => 'Request not found']); exit();
-    }
-    if ($req['currentStage'] !== 'drc') {
-        echo json_encode(['success' => false, 'message' => 'Request is not at DRC stage']); exit();
-    }
+    // 1. Fetch request
+    $stmt = $db->prepare("SELECT * FROM budget_requests WHERE id = ? FOR UPDATE");
+    $stmt->execute([$requestId]);
+    $req = $stmt->fetch();
+
+    if (!$req) throw new Exception('Request not found');
+    if ($req['currentStage'] !== 'drc') throw new Exception('Request is not at DRC stage');
 
     $allowedStatuses = ['drc_rc_forwarded', 'sent_back_to_drc'];
     if (!in_array($req['status'], $allowedStatuses)) {
-        echo json_encode(['success' => false, 'message' => "Cannot approve request with current status: {$req['status']}"]); exit();
+        throw new Exception("Cannot approve request with current status: {$req['status']}");
     }
 
-    // ✅ Read approvalType from DB — set by DR (R&C), not by DRC
     $approvalType = trim((string)($req['approvalType'] ?? ''));
-    $allowedApprovalTypes = ['admin', 'admin_cum_financial'];
-
-    if (!in_array($approvalType, $allowedApprovalTypes)) {
-        echo json_encode([
-            'success' => false,
-            'message' => 'Approval type has not been set by DR (R&C). Please send this request back to DR (R&C) to set the approval type before using Special Approval.',
-        ]); exit();
+    if (!in_array($approvalType, ['admin', 'admin_cum_financial'])) {
+        throw new Exception('Approval type has not been set by DR (R&C).');
     }
 
-    $now     = new UTCDateTime();
-    $history = isset($req['approvalHistory']) ? iterator_to_array($req['approvalHistory']) : [];
-    $history[] = [
-        'stage'           => 'drc',
-        'action'          => 'special_approved',
-        'by'              => $approvedBy,
-        'timestamp'       => date('c'),
-        'remarks'         => $remarks,
-        'approvalType'    => $approvalType,
-        'specialApproval' => true,
-    ];
+    $projectId = $req['projectId'];
+    $headId = $req['headId'];
+    $amount = floatval($req['requestedAmount']);
+    $now = date('Y-m-d H:i:s');
 
-    $db->budget_requests->updateOne(
-        ['_id' => new ObjectId($requestId)],
-        ['$set' => [
-            'status'          => 'approved',
-            'currentStage'    => 'drc',       // stays at drc — never reached director
-            'drcRemarks'      => $remarks,
-            // approvalType is NOT updated — stays as set by DR (R&C)
-            'specialApproval' => true,         // flag for certificate / reporting
-            'approvedBy'      => $approvedBy,
-            'approvedAt'      => $now,
-            'drcApprovedAt'   => $now,
-            'approvalHistory' => $history,
-            'updatedAt'       => $now,
-        ]]
-    );
+    // 2. Book the funds (Consistency check: Approved means Booked)
+    // Fetch head allocation
+    $stmt = $db->prepare("SELECT * FROM head_allocations WHERE projectId = ? AND headId = ? FOR UPDATE");
+    $stmt->execute([$projectId, $headId]);
+    $headAlloc = $stmt->fetch();
+    if (!$headAlloc) throw new Exception('Head allocation not found');
 
-    $approvalTypeLabel = $approvalType === 'admin'
-        ? 'Admin Approval'
-        : 'Admin cum Financial Approval';
+    $available = floatval($headAlloc['releasedAmount']) - floatval($headAlloc['bookedAmount']);
+    if ($amount > $available) {
+        throw new Exception("Insufficient balance for special approval. Available: ₹" . number_format($available, 2));
+    }
+
+    // Update head_allocations
+    $db->prepare("UPDATE head_allocations SET bookedAmount = bookedAmount + ?, updatedAt = ? WHERE projectId = ? AND headId = ?")
+       ->execute([$amount, $now, $projectId, $headId]);
+
+    // Update Project
+    $db->prepare("UPDATE projects SET amountBookedByPI = amountBookedByPI + ?, updatedAt = ? WHERE id = ?")
+       ->execute([$amount, $now, $projectId]);
+
+    // 3. Update Request Status
+    $db->prepare("UPDATE budget_requests SET status = 'approved', currentStage = 'drc', drcRemarks = ?, specialApproval = 1, approvedBy = ?, approvedAt = ?, drcApprovedAt = ?, updatedAt = ? WHERE id = ?")
+       ->execute([$remarks, $approvedBy, $now, $now, $now, $requestId]);
+
+    // 4. Log to history
+    $db->prepare("INSERT INTO approval_history (requestId, stage, action, `by`, timestamp, remarks, approvalType, specialApproval) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+       ->execute([$requestId, 'drc', 'special_approved', $approvedBy, $now, $remarks, $approvalType, 1]);
+
+    $db->commit();
 
     echo json_encode([
         'success' => true,
-        'message' => "Request approved by DRC (Special Approval). Type: {$approvalTypeLabel} (set by DR R&C).",
+        'message' => "Request approved by DRC (Special Approval). Balances updated.",
         'data'    => [
             'status'          => 'approved',
             'currentStage'    => 'drc',
@@ -107,6 +101,7 @@ try {
     ]);
 
 } catch (Exception $e) {
+    if (isset($db) && $db->inTransaction()) $db->rollBack();
     http_response_code(500);
     echo json_encode(['success' => false, 'message' => $e->getMessage()]);
 }

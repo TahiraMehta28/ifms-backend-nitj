@@ -13,118 +13,89 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit();
 }
 
+require_once __DIR__ . '/../config/database.php';
+
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit(); }
+
 ob_start();
 
 try {
-    require_once __DIR__ . '/../config/database.php';
-    
-    $db = getMongoDBConnection();
-    
-    if (!$db) {
-        throw new Exception('Failed to connect to MongoDB');
-    }
-    
-    $method = $_SERVER['REQUEST_METHOD'];
-    
-    if ($method !== 'GET') {
-        throw new Exception('Only GET method is allowed');
-    }
-    
+    $db = getMySQLConnection();
+    if ($_SERVER['REQUEST_METHOD'] !== 'GET') throw new Exception('Only GET method is allowed');
+
     $projectId = $_GET['projectId'] ?? null;
-    
-    if (!$projectId) {
-        throw new Exception('Project ID is required');
-    }
-    
-    // Simply fetch from head_allocations collection
-    $allocations = $db->head_allocations->find(
-        ['projectId' => $projectId],
-        ['sort' => ['headName' => 1]]
-    );
-    
+    if (!$projectId) throw new Exception('Project ID is required');
+
+    // 1. Fetch from head_allocations
+    $stmt = $db->prepare("SELECT * FROM head_allocations WHERE projectId = ? ORDER BY headName ASC");
+    $stmt->execute([$projectId]);
+    $allocs = $stmt->fetchAll();
+
     $allocationsArray = [];
     $totalSanctioned = 0;
     $totalReleased = 0;
-    
-    foreach ($allocations as $alloc) {
-        $sanctioned = floatval($alloc['sanctionedAmount'] ?? 0);
-        $released = floatval($alloc['releasedAmount'] ?? 0);
+
+    if (!empty($allocs)) {
+        foreach ($allocs as $alloc) {
+            $sanc = floatval($alloc['sanctionedAmount']);
+            $rel = floatval($alloc['releasedAmount']);
+            $allocationsArray[] = [
+                'id' => $alloc['headId'] ?: $alloc['id'],
+                'headId' => $alloc['headId'],
+                'headName' => $alloc['headName'],
+                'headType' => $alloc['headType'] ?: 'recurring',
+                'sanctionedAmount' => $sanc,
+                'releasedAmount' => $rel,
+                'remainingAmount' => $sanc - $rel,
+                'status' => $alloc['status'] ?: 'sanctioned',
+                'releaseHistory' => [] // Detailed history fetched in separate API
+            ];
+            $totalSanctioned += $sanc;
+            $totalReleased += $rel;
+        }
+    } else {
+        // 2. Fallback: Initialize from project_heads_list
+        $stmtP = $db->prepare("SELECT gpNumber FROM projects WHERE id = ?");
+        $stmtP->execute([$projectId]);
+        $project = $stmtP->fetch();
         
-        $allocationsArray[] = [
-            'id' => $alloc['headId'] ?? '',
-            'headId' => $alloc['headId'] ?? null,
-            'headName' => $alloc['headName'] ?? '',
-            'headType' => $alloc['headType'] ?? 'recurring',
-            'sanctionedAmount' => $sanctioned,
-            'releasedAmount' => $released,
-            'remainingAmount' => $sanctioned - $released,
-            'status' => $alloc['status'] ?? 'sanctioned',
-            'releaseHistory' => $alloc['releaseHistory'] ?? []
-        ];
-        
-        $totalSanctioned += $sanctioned;
-        $totalReleased += $released;
-    }
-    
-    // If no allocations found, try to initialize from project
-    if (empty($allocationsArray)) {
-        $project = $db->projects->findOne([
-            '_id' => new MongoDB\BSON\ObjectId($projectId)
-        ]);
-        
-        if ($project && isset($project['heads'])) {
-            $heads = $project['heads'];
-            if ($heads instanceof MongoDB\Model\BSONArray) {
-                $heads = iterator_to_array($heads);
-            }
+        if ($project) {
+            $stmtH = $db->prepare("SELECT * FROM project_heads_list WHERE projectId = ?");
+            $stmtH->execute([$projectId]);
+            $heads = $stmtH->fetchAll();
             
-            if (is_array($heads) && count($heads) > 0) {
-                // Initialize head_allocations for this project
-                foreach ($heads as $head) {
-                    if (is_object($head)) {
-                        $head = (array) $head;
-                    }
-                    
-                    $headId = $head['id'] ?? $head['headId'] ?? (string) new MongoDB\BSON\ObjectId();
-                    $sanctioned = floatval($head['sanctionedAmount'] ?? 0);
-                    
-                    $allocationDoc = [
-                        'projectId' => $projectId,
-                        'gpNumber' => $project['gpNumber'] ?? '',
-                        'headId' => $headId,
-                        'headName' => $head['headName'] ?? '',
-                        'headType' => $head['headType'] ?? 'recurring',
-                        'sanctionedAmount' => $sanctioned,
-                        'releasedAmount' => 0,
-                        'remainingAmount' => $sanctioned,
-                        'status' => 'sanctioned',
-                        'releaseHistory' => [],
-                        'createdAt' => new MongoDB\BSON\UTCDateTime(),
-                        'updatedAt' => new MongoDB\BSON\UTCDateTime()
-                    ];
-                    
-                    $db->head_allocations->insertOne($allocationDoc);
-                    
-                    $allocationsArray[] = [
-                        'id' => $headId,
-                        'headId' => $headId,
-                        'headName' => $head['headName'] ?? '',
-                        'headType' => $head['headType'] ?? 'recurring',
-                        'sanctionedAmount' => $sanctioned,
-                        'releasedAmount' => 0,
-                        'remainingAmount' => $sanctioned,
-                        'status' => 'sanctioned',
-                        'releaseHistory' => []
-                    ];
-                    
-                    $totalSanctioned += $sanctioned;
-                }
+            foreach ($heads as $h) {
+                $headId = $h['headId'] ?: bin2hex(random_bytes(12));
+                $sanc = floatval($h['sanctionedAmount']);
+                
+                // Insert into head_allocations
+                $stmtIns = $db->prepare("
+                    INSERT INTO head_allocations 
+                    (id, projectId, gpNumber, headId, headName, headType, sanctionedAmount, releasedAmount, remainingAmount, status, createdAt, updatedAt)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 'sanctioned', NOW(), NOW())
+                ");
+                $stmtIns->execute([
+                    bin2hex(random_bytes(12)), $projectId, $project['gpNumber'], $headId, 
+                    $h['headName'], $h['headType'], $sanc, $sanc
+                ]);
+                
+                $allocationsArray[] = [
+                    'id' => $headId,
+                    'headId' => $headId,
+                    'headName' => $h['headName'],
+                    'headType' => $h['headType'],
+                    'sanctionedAmount' => $sanc,
+                    'releasedAmount' => 0,
+                    'remainingAmount' => $sanc,
+                    'status' => 'sanctioned',
+                    'releaseHistory' => []
+                ];
+                $totalSanctioned += $sanc;
             }
         }
     }
-    
+
     ob_end_clean();
-    
     echo json_encode([
         'success' => true,
         'data' => $allocationsArray,
@@ -132,17 +103,11 @@ try {
         'totalReleased' => $totalReleased,
         'totalRemaining' => $totalSanctioned - $totalReleased
     ]);
-    
+
 } catch (Exception $e) {
-    ob_end_clean();
-    
+    if (ob_get_length()) ob_end_clean();
     error_log("Fund Allocations API Error: " . $e->getMessage());
-    error_log("Stack trace: " . $e->getTraceAsString());
-    
     http_response_code(500);
-    echo json_encode([
-        'success' => false,
-        'message' => $e->getMessage()
-    ]);
+    echo json_encode(['success' => false, 'message' => $e->getMessage()]);
 }
 ?>

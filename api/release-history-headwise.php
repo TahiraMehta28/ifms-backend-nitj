@@ -16,100 +16,87 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 
 require_once __DIR__ . '/../config/database.php';
 
-$db = getMongoDBConnection();
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit(); }
 
 try {
+    $db = getMySQLConnection();
+    
     $projectId = $_GET['projectId'] ?? null;
-    $headId = $_GET['headId'] ?? null; // Optional: filter by specific head
+    $headId = $_GET['headId'] ?? null;
     
-    if (!$projectId) {
-        throw new Exception('projectId parameter is required');
+    if (!$projectId) throw new Exception('projectId parameter is required');
+    
+    // Fetch audit logs for this project
+    $where = ["projectId = ?"];
+    $params = [$projectId];
+    
+    if ($headId) {
+        $where[] = "headId = ?";
+        $params[] = $headId;
     }
     
-    // Build query
-    $query = ['projectId' => $projectId];
+    $query = "SELECT * FROM release_audit_log WHERE " . implode(" AND ", $where) . " ORDER BY releaseDate DESC, id ASC";
+    $stmt = $db->prepare($query);
+    $stmt->execute($params);
+    $logs = $stmt->fetchAll();
     
-    // Fetch all releases for this project
-    $releases = $db->fund_releases->find(
-        $query,
-        ['sort' => ['releasedAt' => -1]] // Newest first
-    );
-    
-    $releasesArray = iterator_to_array($releases);
-    
-    // If filtering by head, filter the results
-    $formattedReleases = [];
-    
-    foreach ($releasesArray as $release) {
-        $releaseData = [
-            'id' => (string) $release['_id'],
-            'releaseNumber' => $release['releaseNumber'] ?? '',
-            'gpNumber' => $release['gpNumber'] ?? '',
-            'letterNumber' => $release['letterNumber'] ?? '',
-            'letterDate' => $release['letterDate'] ? $release['letterDate']->toDateTime()->format('Y-m-d') : null,
-            'remarks' => $release['remarks'] ?? '',
-            'totalReleaseAmount' => floatval($release['totalReleaseAmount'] ?? 0),
-            'releasedBy' => $release['releasedBy'] ?? '',
-            'releasedAt' => $release['releasedAt'] ? $release['releasedAt']->toDateTime()->format('Y-m-d H:i:s') : null,
-            'headwiseReleases' => []
+    // Group logs by releaseNumber to recreate the nested structure
+    $grouped = [];
+    foreach ($logs as $log) {
+        $rn = $log['releaseNumber'];
+        if (!isset($grouped[$rn])) {
+            $grouped[$rn] = [
+                'id' => $rn, // Use releaseNumber as stable ID for grouping
+                'releaseNumber' => $rn,
+                'gpNumber' => $log['gpNumber'],
+                'letterNumber' => $log['letterNumber'],
+                'letterDate' => $log['letterDate'],
+                'remarks' => $log['remarks'],
+                'totalReleaseAmount' => 0,
+                'releasedBy' => $log['releasedBy'],
+                'releasedAt' => $log['releaseDate'],
+                'headwiseReleases' => []
+            ];
+        }
+        
+        $amt = floatval($log['amountReleased']);
+        $grouped[$rn]['totalReleaseAmount'] += $amt;
+        $grouped[$rn]['headwiseReleases'][] = [
+            'id' => $log['headId'],
+            'headId' => $log['headId'],
+            'headName' => $log['headName'],
+            'headType' => $log['headType'],
+            'releaseAmount' => $amt,
         ];
-        
-        // Format head-wise releases
-        if (isset($release['headwiseReleases']) && is_array($release['headwiseReleases'])) {
-            foreach ($release['headwiseReleases'] as $headRelease) {
-                // If filtering by head, only include matching heads
-                if ($headId && isset($headRelease['id']) && $headRelease['id'] !== $headId) {
-                    continue;
-                }
-                
-                $releaseData['headwiseReleases'][] = [
-                    'id' => $headRelease['id'] ?? null,
-                    'headId' => $headRelease['headId'] ?? null,
-                    'headName' => $headRelease['headName'] ?? '',
-                    'headType' => $headRelease['headType'] ?? '',
-                    'sanctionedAmount' => floatval($headRelease['sanctionedAmount'] ?? 0),
-                    'previouslyReleased' => floatval($headRelease['previouslyReleased'] ?? 0),
-                    'releaseAmount' => floatval($headRelease['releaseAmount'] ?? 0),
-                    'newTotalReleased' => floatval($headRelease['newTotalReleased'] ?? 0)
-                ];
-            }
-        }
-        
-        // If filtering by head and no matching heads found, skip this release
-        if ($headId && count($releaseData['headwiseReleases']) === 0) {
-            continue;
-        }
-        
-        $formattedReleases[] = $releaseData;
     }
     
-    // Get summary statistics
-    $totalReleases = count($formattedReleases);
-    $totalAmountReleased = array_sum(array_column($formattedReleases, 'totalReleaseAmount'));
+    $formattedReleases = array_values($grouped);
     
-    // Get unique heads involved in releases
+    // Calculate summaries for parity
+    $totalAmountReleased = 0;
     $headsInvolved = [];
-    foreach ($formattedReleases as $release) {
-        foreach ($release['headwiseReleases'] as $headRelease) {
-            $headName = $headRelease['headName'];
-            if (!isset($headsInvolved[$headName])) {
-                $headsInvolved[$headName] = [
-                    'headName' => $headName,
-                    'headType' => $headRelease['headType'],
-                    'totalReleased' => 0,
-                    'releaseCount' => 0
-                ];
-            }
-            $headsInvolved[$headName]['totalReleased'] += $headRelease['releaseAmount'];
-            $headsInvolved[$headName]['releaseCount']++;
+    foreach ($logs as $log) {
+        $amt = floatval($log['amountReleased']);
+        $totalAmountReleased += $amt;
+        
+        $hName = $log['headName'];
+        if (!isset($headsInvolved[$hName])) {
+            $headsInvolved[$hName] = [
+                'headName' => $hName,
+                'headType' => $log['headType'],
+                'totalReleased' => 0,
+                'releaseCount' => 0
+            ];
         }
+        $headsInvolved[$hName]['totalReleased'] += $amt;
+        $headsInvolved[$hName]['releaseCount']++;
     }
     
     echo json_encode([
         'success' => true,
         'data' => $formattedReleases,
         'summary' => [
-            'totalReleases' => $totalReleases,
+            'totalReleases' => count($formattedReleases),
             'totalAmountReleased' => $totalAmountReleased,
             'headsInvolved' => array_values($headsInvolved)
         ],
@@ -117,15 +104,11 @@ try {
             'projectId' => $projectId,
             'headId' => $headId
         ]
-    ], JSON_PRETTY_PRINT);
+    ]);
     
 } catch (Exception $e) {
     error_log("Get Release History Error: " . $e->getMessage());
-    
     http_response_code(500);
-    echo json_encode([
-        'success' => false,
-        'message' => $e->getMessage()
-    ]);
+    echo json_encode(['success' => false, 'message' => $e->getMessage()]);
 }
 ?>

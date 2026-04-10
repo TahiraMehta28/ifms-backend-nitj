@@ -29,11 +29,12 @@ if (!$requestId) {
 $DR_THRESHOLD = 25000;
 
 try {
-    $db  = getMongoDBConnection();
-    $req = $db->budget_requests->findOne(
-        ['_id' => new \MongoDB\BSON\ObjectId($requestId)],
-        ['projection' => ['quotation' => 0]]
-    );
+    $db = getMySQLConnection();
+
+    // 1. Fetch Request
+    $stmt = $db->prepare("SELECT * FROM budget_requests WHERE id = ?");
+    $stmt->execute([$requestId]);
+    $req = $stmt->fetch();
 
     if (!$req) {
         echo json_encode(['success' => false, 'message' => 'Request not found']); exit();
@@ -42,84 +43,56 @@ try {
         echo json_encode(['success' => false, 'message' => 'Request is not at DR stage']); exit();
     }
 
-    // Accept both AR-approved AND requests sent back from DRC Office for re-processing
     $allowedStatuses = ['ar_approved', 'sent_back_to_dr'];
     if (!in_array($req['status'], $allowedStatuses)) {
         echo json_encode(['success' => false, 'message' => "Cannot process request with status: {$req['status']}"]); exit();
     }
 
-    $now    = new \MongoDB\BSON\UTCDateTime();
-    $amount = 0.0;
-    foreach (['requestedAmount', 'amount', 'bookedAmount'] as $f) {
-        if (isset($req[$f])) {
-            $v = (float)(string)$req[$f];
-            if ($v > 0) { $amount = $v; break; }
-        }
-    }
-
+    $amount = floatval($req['requestedAmount'] ?: $req['amount'] ?: 0);
     $headType = strtolower(trim((string)($req['headType'] ?? '')));
-    $history  = isset($req['approvalHistory']) ? iterator_to_array($req['approvalHistory']) : [];
-
-    // ── NEW RULE ──────────────────────────────────────────────────────────────
-    // DR is final stage ONLY when: amount <= 25000 AND headType == 'consumable'
-    // All other cases (>25k, OR non-consumable even if <=25k) → forward to DRC Office
+    
+    // Logic: DR is final if Consumable AND <= 25k
     $isDRFinal = ($amount <= $DR_THRESHOLD) && ($headType === 'consumable');
+    
+    $action = $isDRFinal ? 'approved' : 'forwarded';
+    $newStatus = $isDRFinal ? 'approved' : 'dr_approved';
+    $newStage = $isDRFinal ? 'dr' : 'drc_office';
+    $timestamp = date('c');
+    $now = date('Y-m-d H:i:s');
 
-    if ($isDRFinal) {
-        // ── FINAL APPROVAL by DR ──────────────────────────────────────────────
-        $history[] = [
-            'stage'     => 'dr',
-            'action'    => 'approved',
-            'by'        => $approvedBy,
-            'timestamp' => date('c'),
-            'remarks'   => $remarks,
-        ];
-        $db->budget_requests->updateOne(
-            ['_id' => new \MongoDB\BSON\ObjectId($requestId)],
-            ['$set' => [
-                'status'          => 'approved',
-                'currentStage'    => 'dr',
-                'drRemarks'       => $remarks,
-                'drApprovedAt'    => $now,
-                'approvedAt'      => $now,
-                'approvalHistory' => $history,
-                'updatedAt'       => $now,
-            ]]
-        );
-        echo json_encode([
-            'success' => true,
-            'message' => 'Request finally approved by DR (Consumable ≤ Rs.25,000).',
-            'data'    => ['status' => 'approved', 'currentStage' => 'dr'],
-        ]);
-    } else {
-        // ── FORWARD TO DRC OFFICE ─────────────────────────────────────────────
-        // Reason: either amount > 25k, OR headType is not consumable (or both)
-        $history[] = [
-            'stage'     => 'dr',
-            'action'    => 'forwarded',
-            'by'        => $approvedBy,
-            'timestamp' => date('c'),
-            'remarks'   => $remarks,
-        ];
-        $db->budget_requests->updateOne(
-            ['_id' => new \MongoDB\BSON\ObjectId($requestId)],
-            ['$set' => [
-                'status'          => 'dr_approved',
-                'currentStage'    => 'drc_office',
-                'drRemarks'       => $remarks,
-                'drApprovedAt'    => $now,
-                'approvalHistory' => $history,
-                'updatedAt'       => $now,
-            ]]
-        );
-        echo json_encode([
-            'success' => true,
-            'message' => 'Request forwarded by DR to DRC Office.',
-            'data'    => ['status' => 'dr_approved', 'currentStage' => 'drc_office'],
-        ]);
-    }
+    // 2. Start Transaction
+    $db->beginTransaction();
+
+    // 3. Update Request
+    $updateSql = "UPDATE budget_requests SET 
+                    status = ?, 
+                    currentStage = ?, 
+                    drRemarks = ?, 
+                    updatedAt = ? " . ($isDRFinal ? ", approvedAt = ?" : "") . "
+                  WHERE id = ?";
+    
+    $updateParams = [$newStatus, $newStage, $remarks, $now];
+    if ($isDRFinal) $updateParams[] = $now;
+    $updateParams[] = $requestId;
+
+    $updateStmt = $db->prepare($updateSql);
+    $updateStmt->execute($updateParams);
+
+    // 4. Insert History
+    $histStmt = $db->prepare("INSERT INTO approval_history (requestId, stage, action, `by`, timestamp, remarks) 
+                              VALUES (?, 'dr', ?, ?, ?, ?)");
+    $histStmt->execute([$requestId, $action, $approvedBy, $timestamp, $remarks]);
+
+    $db->commit();
+
+    echo json_encode([
+        'success' => true,
+        'message' => $isDRFinal ? 'Request finally approved by DR.' : 'Request forwarded by DR to DRC Office.',
+        'data'    => ['status' => $newStatus, 'currentStage' => $newStage],
+    ]);
 
 } catch (Exception $e) {
+    if (isset($db) && $db->inTransaction()) $db->rollBack();
     http_response_code(500);
     echo json_encode(['success' => false, 'message' => $e->getMessage()]);
 }

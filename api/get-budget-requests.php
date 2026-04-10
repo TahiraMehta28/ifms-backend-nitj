@@ -19,136 +19,82 @@ require_once __DIR__ . '/../config/database.php';
 
 $stage = $_GET['stage'] ?? '';
 $type  = $_GET['type']  ?? 'pending';
+$requestId = $_GET['requestId'] ?? null;
+$limit   = intval($_GET['limit']   ?? 0);
+$offset  = intval($_GET['offset']  ?? 0);
+$summary = ($_GET['summary'] ?? '0') === '1';
 
 try {
-    $db         = getMongoDBConnection();
-    $collection = $db->budget_requests;
-
-    $requestId = $_GET['requestId'] ?? null;
+    $db = getMySQLConnection();
+    
+    // Base columns to select
+    $cols = "r.*, p.projectName as projectTitle_join, p.projectEndDate as projectEndDate_join, p.totalSanctionedAmount as projectTotalSanctioned,
+             ha.sanctionedAmount as headSanctionedLimit, ha.releasedAmount as headReleasedLimit, ha.bookedAmount as headBookedLimit";
+    
+    // Build WHERE clause
+    $where = ["1=1"];
+    $params = [];
 
     if ($requestId) {
-        // Single request fetch - ignore everything else
-        try {
-            $filter = ['_id' => new \MongoDB\BSON\ObjectId((string)$requestId)];
-        } catch (Exception $e) {
-            echo json_encode(['success' => false, 'message' => 'Invalid Request ID']);
-            exit();
-        }
+        $where[] = "r.id = ?";
+        $params[] = $requestId;
     } elseif ($type === 'completed') {
-        $filter = ['status' => ['$in' => ['approved', 'rejected']]];
-
+        $where[] = "r.status IN ('approved', 'rejected')";
     } elseif ($stage === 'all' || $type === 'all') {
-        $filter = [];
-
+        // No specific filter
     } elseif ($type === 'pending') {
-        $stageStatusMap = [
-            'da' => ['currentStage' => 'da', 'status' => 'pending'],
-            'ar' => ['currentStage' => 'ar', 'status' => 'da_approved'],
-            'dr' => ['currentStage' => 'dr', 'status' => 'ar_approved'],
-        ];
-
-        if (isset($stageStatusMap[$stage])) {
-            $filter = $stageStatusMap[$stage];
+        if ($stage === 'da') {
+            $where[] = "r.currentStage = 'da' AND r.status = 'pending'";
+        } elseif ($stage === 'ar') {
+            $where[] = "r.currentStage = 'ar' AND r.status = 'da_approved'";
+        } elseif ($stage === 'dr') {
+            $where[] = "r.currentStage = 'dr' AND r.status = 'ar_approved'";
         } else {
-            $filter = [
-                'currentStage' => ['$in' => ['ar', 'dr']],
-                'status'       => ['$nin' => ['approved', 'rejected']],
-            ];
+            $where[] = "r.currentStage IN ('ar', 'dr') AND r.status NOT IN ('approved', 'rejected')";
         }
-    } else {
-        $filter = [];
     }
 
-    $limit   = intval($_GET['limit']   ?? 0);
-    $offset  = intval($_GET['offset']  ?? 0);
-    $summary = ($_GET['summary'] ?? '0') === '1';
-
-    $options = [
-        'sort' => ['createdAt' => -1],
-    ];
+    $whereSql = "WHERE " . implode(" AND ", $where);
+    
+    // Sort and Paging
+    $limitSql = "";
     if ($limit > 0) {
-        $options['limit'] = $limit;
-        $options['skip']  = $offset;
+        $limitSql = " LIMIT $limit OFFSET $offset";
     }
 
-    if ($summary) {
-        $options['projection'] = [
-            'quotation' => 0, 'approvalHistory' => 0, 'description' => 0, 
-            'material' => 0, 'mode' => 0, 'remarks' => 0,
-            'daRemarks' => 0, 'arRemarks' => 0, 'drRemarks' => 0,
-            'drcOfficeRemarks' => 0, 'drcRcRemarks' => 0, 'drcRemarks' => 0, 'directorRemarks' => 0
-        ];
-    } else {
-        $options['projection'] = ['quotation' => 0];
-    }
+    $query = "SELECT $cols 
+              FROM budget_requests r
+              JOIN projects p ON r.projectId = p.id
+              LEFT JOIN head_allocations ha ON r.projectId = ha.projectId AND (r.headId = ha.headId OR r.headName = ha.headName)
+              $whereSql
+              ORDER BY r.createdAt DESC
+              $limitSql";
 
-    $cursor  = $collection->find($filter, $options);
-    $rawResults = iterator_to_array($cursor);
-
-    // ── 1. Batch Fetch Project & Head Allocations ──────────────────
-    $pIds = array_unique(array_filter(array_map(fn($r) => (string)($r['projectId'] ?? ''), $rawResults)));
-    $projectMap = [];
-    if (!empty($pIds)) {
-        $objIds = [];
-        foreach ($pIds as $id) { 
-            try { $objIds[] = new \MongoDB\BSON\ObjectId((string)$id); } 
-            catch (Exception $e) {} 
-        }
-
-        if (!empty($objIds)) {
-            // Fetch projects
-            $projects = $db->projects->find(['_id' => ['$in' => $objIds]], ['projection' => ['projectName' => 1, 'projectEndDate' => 1, 'totalSanctionedAmount' => 1]]);
-            foreach ($projects as $p) {
-                $pid = (string)$p['_id'];
-                $endDate = $p['projectEndDate'] ?? null;
-                $sanctioned = floatval($p['totalSanctionedAmount'] ?? 0);
-                
-                $projectMap[$pid] = [
-                    'name'    => $p['projectName'] ?? '',
-                    'endDate' => ($endDate instanceof MongoDB\BSON\UTCDateTime) ? $endDate->toDateTime()->format('Y-m-d') : ($endDate ?? ''),
-                    'sanctionedAmount' => $sanctioned,
-                    'heads' => []
-                ];
-            }
-
-            // Fetch head allocations for these projects to get head-specific sanctioned amounts
-            $pIdStrings = array_map('strval', array_values($pIds));
-            $headAllocs = $db->head_allocations->find(['projectId' => ['$in' => $pIdStrings]]);
-            foreach ($headAllocs as $ha) {
-                $pid = (string)$ha['projectId'];
-                $hId = (string)($ha['headId'] ?? '');
-                $hName = (string)($ha['headName'] ?? '');
-                if (isset($projectMap[$pid])) {
-                    $key = $hId ?: $hName;
-                    
-                    // Sanction Limit should show released amount if available
-                    $sanctioned = floatval($ha['releasedAmount'] ?? 0);
-                    if ($sanctioned <= 0) $sanctioned = floatval($ha['sanctionedAmount'] ?? 0);
-
-                    $projectMap[$pid]['heads'][$key] = [
-                        'sanctioned' => $sanctioned,
-                        'booked' => floatval($ha['bookedAmount'] ?? 0),
-                        'type' => $ha['headType'] ?? ''
-                    ];
-                }
-            }
-        }
-    }
+    $stmt = $db->prepare($query);
+    $stmt->execute($params);
+    $rows = $stmt->fetchAll();
 
     $result = [];
-    foreach ($rawResults as $r) {
-        $amount = floatval($r['requestedAmount'] ?? $r['amount'] ?? 0);
-        $pid    = (string)($r['projectId'] ?? '');
+    foreach ($rows as $r) {
+        // Format dates
+        $createdAt = $r['createdAt'] ? date('Y-m-d H:i:s', strtotime($r['createdAt'])) : '';
+        $updatedAt = $r['updatedAt'] ? date('Y-m-d H:i:s', strtotime($r['updatedAt'])) : '';
 
-        $approvalHistory = isset($r['approvalHistory'])
-            ? array_values(iterator_to_array($r['approvalHistory']))
-            : [];
+        // Determine head sanctioned limit (match legacy logic: released if available, else sanctioned)
+        $hLimit = floatval($r['headReleasedLimit'] ?: $r['headSanctionedLimit'] ?: 0);
 
-        // Compute latestRemark from history
+        // Build history (we'll fetch separately if not summary)
+        $history = [];
+        if (!$summary) {
+            $hStmt = $db->prepare("SELECT * FROM approval_history WHERE requestId = ? ORDER BY timestamp ASC");
+            $hStmt->execute([$r['id']]);
+            $history = $hStmt->fetchAll();
+        }
+
+        // Latest Remark
         $latestRemark = '';
-        if (!empty($approvalHistory)) {
-            for ($i = count($approvalHistory) - 1; $i >= 0; $i--) {
-                $h = (array)$approvalHistory[$i];
+        if (!empty($history)) {
+            foreach (array_reverse($history) as $h) {
                 if (!empty($h['remarks'])) {
                     $latestRemark = $h['remarks'];
                     break;
@@ -156,60 +102,58 @@ try {
             }
         }
 
-        $hId    = (string)($r['headId']   ?? '');
-        $hName  = (string)($r['headName'] ?? '');
-        $hKey    = $hId ?: $hName;
-        $projData = $projectMap[$pid] ?? ['name' => '', 'endDate' => '', 'sanctionedAmount' => 0, 'heads' => []];
-        $headDetails = $projData['heads'][$hKey] ?? ['sanctioned' => 0, 'booked' => 0];
+        $amount = floatval($r['requestedAmount'] ?: $r['amount'] ?: 0);
 
-        $result[] = [
-            'id'              => (string)($r['_id']),
-            'requestNumber'   => $r['requestNumber']   ?? '',
-            'projectId'       => $pid,
-            'gpNumber'        => $r['gpNumber']        ?? '',
-            'projectTitle'    => $r['projectTitle']    ?? $projData['name'] ?? '',
-            'piName'          => $r['piName']          ?? '',
-            'piEmail'         => $r['piEmail']         ?? '',
-            'department'      => $r['department']      ?? '',
-            'purpose'         => $r['purpose']         ?? '',
-            'description'     => $r['description']     ?? '',
+        $item = [
+            'id'              => $r['id'],
+            'requestNumber'   => $r['requestNumber'],
+            'projectId'       => $r['projectId'],
+            'gpNumber'        => $r['gpNumber'],
+            'projectTitle'    => $r['projectTitle_join'],
+            'piName'          => $r['piName'],
+            'piEmail'         => $r['piEmail'],
+            'department'      => $r['department'],
+            'purpose'         => $r['purpose'],
+            'description'     => $summary ? '' : $r['description'],
             'amount'          => $amount,
             'requestedAmount' => $amount,
-            'projectType'     => $r['projectType']     ?? '',
-            'invoiceNumber'   => $r['invoiceNumber']   ?? '',
-            'material'        => $r['material']        ?? '',
-            'mode'            => $r['mode']            ?? '',
-            'fileNumber'      => $r['fileNumber']      ?? '',
-            'projectEndDate'  => $projData['endDate'] ?: ($r['projectCompletionDate'] ?? ''),
-            'totalSanctionedAmount' => floatval($projData['sanctionedAmount'] ?? 0),
-            'headId'          => $hId,
-            'headName'        => $hName,
-            'headType'        => $r['headType']        ?? '',
-            'headSanctionedAmount' => floatval($headDetails['sanctioned']),
-            'headBookedAmount'     => floatval($headDetails['booked']),
-            'status'          => $r['status']          ?? 'pending',
-            'currentStage'    => $r['currentStage']    ?? 'da',
-            'daRemarks'       => $r['daRemarks']       ?? '',
-            'arRemarks'       => $r['arRemarks']       ?? '',
-            'drRemarks'       => $r['drRemarks']       ?? '',
-            'drcOfficeRemarks' => $r['drcOfficeRemarks'] ?? '',
-            'drcRcRemarks'     => $r['drcRcRemarks']     ?? '',
-            'drcRemarks'       => $r['drcRemarks']       ?? '',
-            'directorRemarks'  => $r['directorRemarks']  ?? '',
-            'actualExpenditure' => floatval($r['actualExpenditure'] ?? 0),
-            'approvalHistory' => $approvalHistory,
+            'projectType'     => $r['projectType'],
+            'invoiceNumber'   => $r['invoiceNumber'],
+            'material'        => $summary ? '' : $r['material'],
+            'expenditure'     => $summary ? '' : $r['expenditure'],
+            'mode'            => $summary ? '' : $r['mode'],
+            'fileNumber'      => $r['fileNumber'],
+            'projectEndDate'  => $r['projectEndDate_join'],
+            'totalSanctionedAmount' => floatval($r['projectTotalSanctioned']),
+            'headId'          => $r['headId'],
+            'headName'        => $r['headName'],
+            'headType'        => $r['headType'],
+            'headSanctionedAmount' => $hLimit,
+            'headBookedAmount'     => floatval($r['headBookedLimit']),
+            'status'          => $r['status'],
+            'currentStage'    => $r['currentStage'],
+            'daRemarks'       => $r['daRemarks'],
+            'arRemarks'       => $r['arRemarks'],
+            'drRemarks'       => $r['drRemarks'],
+            'drcOfficeRemarks' => $r['drcOfficeRemarks'],
+            'drcRcRemarks'     => $r['drcRcRemarks'],
+            'drcRemarks'       => $r['drcRemarks'],
+            'directorRemarks'  => $r['directorRemarks'],
+            'actual_exp' => floatval($r['actual_exp'] ?: 0),
+            'approvalHistory' => $history,
             'latestRemark'    => $latestRemark,
-            'createdAt'       => isset($r['createdAt'])
-                ? $r['createdAt']->toDateTime()->format('Y-m-d H:i:s') : '',
-            'updatedAt'       => isset($r['updatedAt'])
-                ? $r['updatedAt']->toDateTime()->format('Y-m-d H:i:s') : '',
+            'createdAt'       => $createdAt,
+            'updatedAt'       => $updatedAt,
         ];
+
+        $result[] = $item;
     }
 
     echo json_encode(['success' => true, 'data' => $result, 'count' => count($result)]);
 
 } catch (Throwable $e) {
+    error_log("get-budget-requests error: " . $e->getMessage());
     http_response_code(500);
-    echo json_encode(['success' => false, 'message' => $e->getMessage(), 'trace' => $e->getTraceAsString()]);
+    echo json_encode(['success' => false, 'message' => $e->getMessage()]);
 }
 ?>

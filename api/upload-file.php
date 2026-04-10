@@ -10,19 +10,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 
 require_once __DIR__ . '/../config/database.php';
 
-$db = getMongoDBConnection();
-$filesCollection = $db->project_files;
-$projectsCollection = $db->projects;
-
-$method = $_SERVER['REQUEST_METHOD'];
-
 try {
+    $db = getMySQLConnection();
+    $method = $_SERVER['REQUEST_METHOD'];
+
     switch ($method) {
         case 'POST':
-            // Handle file upload
-            if (!isset($_FILES['file'])) {
-                throw new Exception('No file uploaded');
-            }
+            if (!isset($_FILES['file'])) throw new Exception('No file uploaded');
             
             $file = $_FILES['file'];
             $projectId = $_POST['projectId'] ?? null;
@@ -30,193 +24,80 @@ try {
             $fileType = $_POST['fileType'] ?? 'sanction_letter';
             $uploadedBy = $_POST['uploadedBy'] ?? 'admin_user';
             
-            if (!$projectId || !$gpNumber) {
-                throw new Exception('Project ID and GP Number are required');
-            }
+            if (!$projectId || !$gpNumber) throw new Exception('Project ID and GP Number are required');
             
-            // Validate file
-            $allowedTypes = ['application/pdf'];
-            if (!in_array($file['type'], $allowedTypes)) {
-                throw new Exception('Only PDF files are allowed');
-            }
+            if ($file['type'] !== 'application/pdf') throw new Exception('Only PDF files are allowed');
+            if ($file['size'] > 10 * 1024 * 1024) throw new Exception('File size exceeds 10MB');
             
-            // Check file size (max 10MB)
-            $maxSize = 10 * 1024 * 1024; // 10MB
-            if ($file['size'] > $maxSize) {
-                throw new Exception('File size must be less than 10MB');
-            }
-            
-            // Create upload directory if it doesn't exist
             $uploadBaseDir = __DIR__ . '/../../uploads/projects/';
             $uploadDir = $uploadBaseDir . $gpNumber . '/';
+            if (!file_exists($uploadDir)) mkdir($uploadDir, 0777, true);
             
-            if (!file_exists($uploadBaseDir)) {
-                mkdir($uploadBaseDir, 0777, true);
-            }
-            
-            if (!file_exists($uploadDir)) {
-                mkdir($uploadDir, 0777, true);
-            }
-            
-            // Generate unique filename
-            $fileExtension = pathinfo($file['name'], PATHINFO_EXTENSION);
-            $fileName = $fileType . '_' . time() . '.' . $fileExtension;
+            $fileExt = pathinfo($file['name'], PATHINFO_EXTENSION);
+            $fileName = $fileType . '_' . time() . '.' . $fileExt;
             $filePath = $uploadDir . $fileName;
             
-            // Move uploaded file
-            if (!move_uploaded_file($file['tmp_name'], $filePath)) {
-                throw new Exception('Failed to upload file');
-            }
+            if (!move_uploaded_file($file['tmp_name'], $filePath)) throw new Exception('Failed to upload file');
             
-            // Store file information in database
-            $document = [
-                'projectId' => $projectId,
-                'gpNumber' => $gpNumber,
-                'fileName' => $file['name'],
-                'storedFileName' => $fileName,
-                'fileType' => $fileType,
-                'filePath' => '/uploads/projects/' . $gpNumber . '/' . $fileName,
-                'fileSize' => $file['size'],
-                'mimeType' => $file['type'],
-                'uploadedAt' => new MongoDB\BSON\UTCDateTime(),
-                'uploadedBy' => $uploadedBy
-            ];
+            $dbPath = '/uploads/projects/' . $gpNumber . '/' . $fileName;
+            $fileId = bin2hex(random_bytes(12));
+            $now = date('Y-m-d H:i:s');
+
+            // Store file record
+            $stmt = $db->prepare("INSERT INTO project_files (id, projectId, gpNumber, fileName, storedFileName, fileType, filePath, fileSize, mimeType, uploadedBy, uploadedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+            $stmt->execute([$fileId, $projectId, $gpNumber, $file['name'], $fileName, $fileType, $dbPath, $file['size'], $file['type'], $uploadedBy, $now]);
             
-            $result = $filesCollection->insertOne($document);
-            
-            // Update project with sanctionedLetterFile field
-            $projectsCollection->updateOne(
-                ['_id' => new MongoDB\BSON\ObjectId($projectId)],
-                [
-                    '$set' => [
-                        'sanctionedLetterFile' => $document['filePath'],
-                        'sanctionedLetterFileName' => $file['name'],
-                        'sanctionedLetterUploadedAt' => new MongoDB\BSON\UTCDateTime(),
-                        'updatedAt' => new MongoDB\BSON\UTCDateTime()
-                    ]
-                ]
-            );
+            // Update project record
+            $stmt = $db->prepare("UPDATE projects SET sanctionedLetterFile = ?, sanctionedLetterFileName = ?, updatedAt = ? WHERE id = ?");
+            $stmt->execute([$dbPath, $file['name'], $now, $projectId]);
             
             header('Content-Type: application/json');
-            echo json_encode([
-                'success' => true,
-                'message' => 'File uploaded successfully',
-                'fileId' => (string) $result->getInsertedId(),
-                'fileName' => $file['name'],
-                'filePath' => $document['filePath'],
-                'fileSize' => $file['size']
-            ]);
+            echo json_encode(['success' => true, 'message' => 'File uploaded successfully', 'fileId' => $fileId, 'fileName' => $file['name'], 'filePath' => $dbPath]);
             break;
 
         case 'GET':
-            // Get files for a project
             $projectId = $_GET['projectId'] ?? null;
             $gpNumber = $_GET['gpNumber'] ?? null;
             $fileId = $_GET['id'] ?? null;
             
+            header('Content-Type: application/json');
             if ($fileId) {
-                // Get single file
-                $file = $filesCollection->findOne(['_id' => new MongoDB\BSON\ObjectId($fileId)]);
-                
-                if (!$file) {
-                    throw new Exception('File not found');
-                }
-                
-                $file['id'] = (string) $file['_id'];
-                unset($file['_id']);
-                
-                if (isset($file['uploadedAt'])) {
-                    $file['uploadedAt'] = $file['uploadedAt']->toDateTime()->format('Y-m-d H:i:s');
-                }
-                
-                header('Content-Type: application/json');
-                echo json_encode([
-                    'success' => true,
-                    'data' => $file
-                ]);
+                $stmt = $db->prepare("SELECT * FROM project_files WHERE id = ?");
+                $stmt->execute([$fileId]);
+                $file = $stmt->fetch();
+                if (!$file) throw new Exception('File not found');
+                echo json_encode(['success' => true, 'data' => $file]);
             } else {
-                // Get all files for project
-                $filter = [];
-                if ($projectId) {
-                    $filter['projectId'] = $projectId;
-                }
-                if ($gpNumber) {
-                    $filter['gpNumber'] = $gpNumber;
-                }
+                $query = "SELECT * FROM project_files WHERE 1=1";
+                $params = [];
+                if ($projectId) { $query .= " AND projectId = ?"; $params[] = $projectId; }
+                if ($gpNumber) { $query .= " AND gpNumber = ?"; $params[] = $gpNumber; }
+                $query .= " ORDER BY uploadedAt DESC";
                 
-                $cursor = $filesCollection->find($filter, [
-                    'sort' => ['uploadedAt' => -1]
-                ]);
-                
-                $files = [];
-                foreach ($cursor as $file) {
-                    $file['id'] = (string) $file['_id'];
-                    unset($file['_id']);
-                    
-                    if (isset($file['uploadedAt'])) {
-                        $file['uploadedAt'] = $file['uploadedAt']->toDateTime()->format('Y-m-d H:i:s');
-                    }
-                    
-                    $files[] = $file;
-                }
-                
-                header('Content-Type: application/json');
-                echo json_encode([
-                    'success' => true,
-                    'data' => $files,
-                    'count' => count($files)
-                ]);
+                $stmt = $db->prepare($query);
+                $stmt->execute($params);
+                $files = $stmt->fetchAll();
+                echo json_encode(['success' => true, 'data' => $files, 'count' => count($files)]);
             }
             break;
 
         case 'DELETE':
-            // Delete file
             $id = $_GET['id'] ?? null;
+            if (!$id) throw new Exception('File ID is required');
             
-            if (!$id) {
-                throw new Exception('File ID is required');
-            }
+            $stmt = $db->prepare("SELECT * FROM project_files WHERE id = ?");
+            $stmt->execute([$id]);
+            $file = $stmt->fetch();
+            if (!$file) throw new Exception('File not found');
             
-            // Get file info
-            $file = $filesCollection->findOne(['_id' => new MongoDB\BSON\ObjectId($id)]);
-            
-            if (!$file) {
-                throw new Exception('File not found');
-            }
-            
-            // Delete physical file
             $physicalPath = __DIR__ . '/../../' . $file['filePath'];
-            if (file_exists($physicalPath)) {
-                unlink($physicalPath);
-            }
+            if (file_exists($physicalPath)) unlink($physicalPath);
             
-            // Delete database record
-            $result = $filesCollection->deleteOne(['_id' => new MongoDB\BSON\ObjectId($id)]);
-            
+            $db->prepare("DELETE FROM project_files WHERE id = ?")->execute([$id]);
             // Update project to remove file reference
-            $projectsCollection->updateOne(
-                ['_id' => new MongoDB\BSON\ObjectId($file['projectId'])],
-                [
-                    '$unset' => [
-                        'sanctionedLetterFile' => '',
-                        'sanctionedLetterFileName' => '',
-                        'sanctionedLetterUploadedAt' => ''
-                    ],
-                    '$set' => [
-                        'updatedAt' => new MongoDB\BSON\UTCDateTime()
-                    ]
-                ]
-            );
+            $db->prepare("UPDATE projects SET sanctionedLetterFile = NULL, sanctionedLetterFileName = NULL, updatedAt = NOW() WHERE id = ?")->execute([$file['projectId']]);
             
-            if ($result->getDeletedCount() > 0) {
-                header('Content-Type: application/json');
-                echo json_encode([
-                    'success' => true,
-                    'message' => 'File deleted successfully'
-                ]);
-            } else {
-                throw new Exception('Failed to delete file');
-            }
+            echo json_encode(['success' => true, 'message' => 'File deleted successfully']);
             break;
 
         default:

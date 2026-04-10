@@ -10,9 +10,6 @@ header('Content-Type: application/json');
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit(); }
 
-use MongoDB\BSON\ObjectId;
-use MongoDB\BSON\UTCDateTime;
-
 require_once __DIR__ . '/../config/database.php';
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
@@ -29,11 +26,12 @@ if (!$requestId) { echo json_encode(['success' => false, 'message' => 'requestId
 if (empty($remarks)) { echo json_encode(['success' => false, 'message' => 'Query remarks required']); exit(); }
 
 try {
-    $db  = getMongoDBConnection();
-    $req = $db->budget_requests->findOne(
-        ['_id' => new \MongoDB\BSON\ObjectId($requestId)],
-        ['projection' => ['quotation' => 0]]
-    );
+    $db = getMySQLConnection();
+    
+    // Fetch request metadata
+    $stmt = $db->prepare("SELECT status, currentStage FROM budget_requests WHERE id = ?");
+    $stmt->execute([$requestId]);
+    $req = $stmt->fetch();
 
     if (!$req) { echo json_encode(['success' => false, 'message' => 'Request not found']); exit(); }
     if (in_array($req['status'], ['approved', 'rejected'])) {
@@ -46,50 +44,32 @@ try {
         'drc' => 'DRC', 'director' => 'Director',
     ];
     $stageLabel = $stageLabels[$req['currentStage']] ?? strtoupper($req['currentStage']);
+    $now = date('Y-m-d H:i:s');
 
-    $now     = new \MongoDB\BSON\UTCDateTime();
-    $history = isset($req['approvalHistory']) ? iterator_to_array($req['approvalHistory']) : [];
-    $history[] = [
-        'stage'     => $req['currentStage'],
-        'action'    => 'query_raised',
-        'by'        => $queryBy,
-        'queryTo'   => $queryTo,
-        'timestamp' => date('c'),
-        'remarks'   => $remarks,
-    ];
+    $db->beginTransaction();
 
-    $db->budget_requests->updateOne(
-        ['_id' => new ObjectId($requestId)],
-        [
-            '$set' => [
-                // ✅ KEY FIX: change status so both dashboards can filter on it
-                'status'           => 'query_raised',
-                'previousStatus'   => $req['status'],     // save to restore on resolve
-                'hasOpenQuery'     => true,
-                'latestQuery'      => [
-                    'query'        => $remarks,
-                    'raisedBy'     => $queryBy,
-                    'raisedByLabel'=> $stageLabel,
-                    'raisedAt'     => date('c'),
-                    'raisedStage'  => $req['currentStage'],
-                    'resolved'     => false,
-                ],
-                'approvalHistory'  => $history,
-                'updatedAt'        => $now,
-            ],
-            '$push' => [
-                'queries' => [
-                    'by'        => $queryBy,
-                    'byLabel'   => $stageLabel,
-                    'to'        => $queryTo,
-                    'query'     => $remarks,
-                    'stage'     => $req['currentStage'],
-                    'timestamp' => date('c'),
-                    'resolved'  => false,
-                ],
-            ],
-        ]
-    );
+    // 1. Update request status
+    $sql = "UPDATE budget_requests 
+            SET status = 'query_raised', 
+                previousStatus = ?, 
+                hasOpenQuery = 1, 
+                updatedAt = ? 
+            WHERE id = ?";
+    $db->prepare($sql)->execute([$req['status'], $now, $requestId]);
+
+    // 2. Insert into budget_request_queries
+    $sqlQuery = "INSERT INTO budget_request_queries (requestId, `by`, byLabel, `to`, query, stage, timestamp, resolved) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 0)";
+    $db->prepare($sqlQuery)->execute([
+        $requestId, $queryBy, $stageLabel, $queryTo, $remarks, $req['currentStage'], $now
+    ]);
+
+    // 3. Add to approval history
+    $sqlHist = "INSERT INTO approval_history (requestId, stage, action, `by`, remarks, timestamp) 
+                VALUES (?, ?, 'query_raised', ?, ?, ?)";
+    $db->prepare($sqlHist)->execute([$requestId, $req['currentStage'], $queryBy, $remarks, $now]);
+
+    $db->commit();
 
     echo json_encode([
         'success' => true,
@@ -98,6 +78,8 @@ try {
     ]);
 
 } catch (Exception $e) {
+    if (isset($db) && $db->inTransaction()) $db->rollBack();
+    error_log("raise-query error: " . $e->getMessage());
     http_response_code(500);
     echo json_encode(['success' => false, 'message' => $e->getMessage()]);
 }

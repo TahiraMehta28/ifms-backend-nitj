@@ -4,625 +4,248 @@
  * GP Format: GP/YY-YY/XXX (e.g., GP/25-26/001)
  * Financial Year: April to March
  * 
- * New Fields: amountBookedByPI, actualExpenditure
+ * New Fields: amountBookedByPI, actual_exp
  */
 class Project {
-    private $collection;
     private $db;
 
     public function __construct($db) {
-        $this->db = $db;
-        $this->collection = $db->projects;
+        $this->db = $db; // PDO instance
     }
 
-    /**
-     * Generate unique GP Number based on financial year
-     * Format: GP/YY-YY/XXX
-     * Financial Year: April (4) to March (3)
-     */
     private function generateGPNumber() {
         $currentDate = new DateTime();
-        $currentMonth = (int) $currentDate->format('n'); // 1-12
+        $currentMonth = (int) $currentDate->format('n');
         $currentYear = (int) $currentDate->format('Y');
         
-        // Determine financial year
         if ($currentMonth >= 4) {
-            // April onwards - current year to next year
             $fyStart = $currentYear;
             $fyEnd = $currentYear + 1;
         } else {
-            // January to March - previous year to current year
             $fyStart = $currentYear - 1;
             $fyEnd = $currentYear;
         }
         
-        // Format: YY-YY (e.g., 25-26)
-        $financialYear = sprintf(
-            "%02d-%02d",
-            $fyStart % 100,
-            $fyEnd % 100
-        );
+        $financialYear = sprintf("%02d-%02d", $fyStart % 100, $fyEnd % 100);
+        $prefix = "GP/{$financialYear}/%";
         
-        // Find the last GP number for this financial year
-        $regex = new MongoDB\BSON\Regex("^GP/{$financialYear}/", 'i');
-        $lastProject = $this->collection->findOne(
-            ['gpNumber' => $regex],
-            ['sort' => ['gpNumber' => -1]]
-        );
+        $stmt = $this->db->prepare("SELECT gpNumber FROM projects WHERE gpNumber LIKE ? ORDER BY gpNumber DESC LIMIT 1");
+        $stmt->execute([$prefix]);
+        $lastProject = $stmt->fetch();
 
         if ($lastProject && isset($lastProject['gpNumber'])) {
-            // Extract sequence number from GP/YY-YY/XXX
             $parts = explode('/', $lastProject['gpNumber']);
             $lastNumber = intval(end($parts));
             $newNumber = $lastNumber + 1;
         } else {
-            // First project of this financial year
             $newNumber = 1;
         }
 
         return sprintf("GP/%s/%03d", $financialYear, $newNumber);
     }
 
-    /**
-     * Calculate project duration in years
-     */
     private function calculateDuration($startDate, $endDate) {
-        if (!$startDate || !$endDate) {
-            return 0;
-        }
-        
+        if (!$startDate || !$endDate) return 0;
         $start = new DateTime($startDate);
         $end = new DateTime($endDate);
         $interval = $start->diff($end);
-        
-        $years = $interval->y + ($interval->m / 12) + ($interval->d / 365.25);
-        return round($years, 2);
+        return round($interval->y + ($interval->m / 12) + ($interval->d / 365.25), 2);
     }
 
-    /**
-     * Create a new project
-     */
     public function create($data) {
         try {
-            if (!$data || !is_array($data)) {
-                throw new Exception("Invalid data received");
-            }
+            if (!$data || !is_array($data)) throw new Exception("Invalid data");
 
-            if (!empty($data['gpNumber'])) {
-                if (!preg_match('/^GP\/\d{2}-\d{2}\/\d{3}$/', $data['gpNumber'])) {
-                    throw new Exception("Invalid GP Number format. Expected: GP/YY-YY/XXX (e.g., GP/25-26/001)");
-                }
-                $gpNumber = $data['gpNumber'];
-                
-                $existing = $this->collection->findOne(['gpNumber' => $gpNumber]);
-                if ($existing) {
-                    throw new Exception("GP Number {$gpNumber} already exists");
-                }
-            } else {
-                $gpNumber = $this->generateGPNumber();
-            }
+            $gpNumber = !empty($data['gpNumber']) ? $data['gpNumber'] : $this->generateGPNumber();
+            $projectId = bin2hex(random_bytes(12));
+            $now = date('Y-m-d H:i:s');
 
             $startDate = null;
+            if (!empty($data['projectStartYear'])) {
+                $startDate = $data['projectStartYear'] . '-' . str_pad($data['projectStartMonth'], 2, '0', STR_PAD_LEFT) . '-' . str_pad($data['projectStartDate'], 2, '0', STR_PAD_LEFT);
+            }
             $endDate = null;
+            if (!empty($data['projectEndYear'])) {
+                $endDate = $data['projectEndYear'] . '-' . str_pad($data['projectEndMonth'], 2, '0', STR_PAD_LEFT) . '-' . str_pad($data['projectEndDate'], 2, '0', STR_PAD_LEFT);
+            }
+
+            $totalYears = ($startDate && $endDate) ? $this->calculateDuration($startDate, $endDate) : floatval($data['totalYears'] ?? 0);
+
+            $this->db->beginTransaction();
+
+            $sql = "INSERT INTO projects (id, gpNumber, isOldProject, modeOfProject, projectName, projectAgencyName, sanctionOrderNo, nameOfScheme, piName, piEmail, department, projectStartDate, projectEndDate, originalEndDate, totalYears, totalSanctionedAmount, totalAllocatedAmount, totalReleasedAmount, status, createdAt, updatedAt) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)";
             
-            if (!empty($data['projectStartYear']) && !empty($data['projectStartMonth']) && !empty($data['projectStartDate'])) {
-                $startDate = new DateTime(
-                    $data['projectStartYear'] . '-' . 
-                    str_pad($data['projectStartMonth'], 2, '0', STR_PAD_LEFT) . '-' . 
-                    str_pad($data['projectStartDate'], 2, '0', STR_PAD_LEFT)
-                );
-            }
+            $stmt = $this->db->prepare($sql);
+            $stmt->execute([
+                $projectId, $gpNumber, !empty($data['isOldProject']) ? 1 : 0, 
+                $data['modeOfProject'] ?? '', $data['projectName'] ?? '', $data['projectAgencyName'] ?? '',
+                $data['sanctionOrderNo'] ?? '', $data['nameOfScheme'] ?? '', $data['piName'] ?? '',
+                $data['piEmail'] ?? '', $data['department'] ?? '', $startDate, $endDate, $endDate,
+                $totalYears, floatval($data['totalSanctionedAmount'] ?? 0), 0,
+                $data['status'] ?? 'pending', $now, $now
+            ]);
 
-            if (!empty($data['projectEndYear']) && !empty($data['projectEndMonth']) && !empty($data['projectEndDate'])) {
-                $endDate = new DateTime(
-                    $data['projectEndYear'] . '-' . 
-                    str_pad($data['projectEndMonth'], 2, '0', STR_PAD_LEFT) . '-' . 
-                    str_pad($data['projectEndDate'], 2, '0', STR_PAD_LEFT)
-                );
-            }
-
-            $totalYears = 0;
-            if ($startDate && $endDate) {
-                $totalYears = $this->calculateDuration(
-                    $startDate->format('Y-m-d'),
-                    $endDate->format('Y-m-d')
-                );
-            } elseif (!empty($data['totalYears'])) {
-                $totalYears = floatval($data['totalYears']);
-            }
-
-            $totalAllocatedAmount = 0;
-            $headsInfo = [];
             if (isset($data['allocations']) && is_array($data['allocations'])) {
-                foreach ($data['allocations'] as $allocation) {
-                    $sanctionedAmount = floatval($allocation['sanctionedAmount'] ?? 0);
-                    $totalAllocatedAmount += $sanctionedAmount;
+                $totalAlloc = 0;
+                foreach ($data['allocations'] as $alloc) {
+                    $amt = floatval($alloc['sanctionedAmount'] ?? 0);
+                    $totalAlloc += $amt;
+                    $this->db->prepare("INSERT INTO project_heads_list (projectId, headId, headName, headType, sanctionedAmount) VALUES (?, ?, ?, ?, ?)")
+                             ->execute([$projectId, $alloc['headId'], $alloc['headName'], $alloc['headType'], $amt]);
                     
-                    $headsInfo[] = [
-                        'headId' => $allocation['headId'] ?? null,
-                        'headName' => htmlspecialchars(strip_tags($allocation['headName'] ?? '')),
-                        'headType' => htmlspecialchars(strip_tags($allocation['headType'] ?? '')),
-                        'sanctionedAmount' => $sanctionedAmount
-                    ];
+                    $this->db->prepare("INSERT INTO head_allocations (id, projectId, gpNumber, headId, headName, headType, sanctionedAmount, releasedAmount, bookedAmount, status, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 'active', ?, ?)")
+                             ->execute([bin2hex(random_bytes(12)), $projectId, $gpNumber, $alloc['headId'], $alloc['headName'], $alloc['headType'], $amt, $now, $now]);
                 }
+                $this->db->prepare("UPDATE projects SET totalAllocatedAmount = ? WHERE id = ?")->execute([$totalAlloc, $projectId]);
             }
 
-            $document = [
-                'gpNumber' => $gpNumber,
-                'isOldProject' => !empty($data['isOldProject']),
-                'modeOfProject' => htmlspecialchars(strip_tags($data['modeOfProject'] ?? '')),
-                'projectName' => htmlspecialchars(strip_tags($data['projectName'] ?? '')),
-                'projectAgencyName' => htmlspecialchars(strip_tags($data['projectAgencyName'] ?? '')),
-                'sanctionOrderNo' => htmlspecialchars(strip_tags($data['sanctionOrderNo'] ?? '')),
-                'nameOfScheme' => htmlspecialchars(strip_tags($data['nameOfScheme'] ?? '')),
-                'piName' => htmlspecialchars(strip_tags($data['piName'] ?? '')),
-                'piEmail' => htmlspecialchars(strip_tags($data['piEmail'] ?? '')),
-                'department' => htmlspecialchars(strip_tags($data['department'] ?? '')),
-                
-                'projectStartDate' => $startDate ? new MongoDB\BSON\UTCDateTime($startDate->getTimestamp() * 1000) : null,
-                'projectEndDate' => $endDate ? new MongoDB\BSON\UTCDateTime($endDate->getTimestamp() * 1000) : null,
-                'originalEndDate' => $endDate ? new MongoDB\BSON\UTCDateTime($endDate->getTimestamp() * 1000) : null,
-                'hasExtension' => false,
-                
-                'totalYears' => $totalYears,
-                
-                'totalSanctionedAmount' => floatval($data['totalSanctionedAmount'] ?? 0),
-                'totalAllocatedAmount' => $totalAllocatedAmount,
-                'totalReleasedAmount' => 0,
-                'amountBookedByPI' => 0,
-                'actualExpenditure' => 0,
-                'bankDetails' => 'Canara Bank',
-                
-                'heads' => $headsInfo,
-                
-                'sanctionedLetterFile' => null,
-                'sanctionedLetterFileName' => null,
-                'sanctionedLetterUploadedAt' => null,
-                
-                'status' => htmlspecialchars(strip_tags($data['status'] ?? 'pending')),
-                
-                'createdAt' => new MongoDB\BSON\UTCDateTime(),
-                'updatedAt' => new MongoDB\BSON\UTCDateTime()
-            ];
-
-            if (!$document['projectName'] || !$document['piName'] || !$document['department']) {
-                throw new Exception("Missing required fields");
-            }
-
-            $result = $this->collection->insertOne($document);
-            $projectId = (string) $result->getInsertedId();
-
-            if (isset($data['allocations']) && !empty($data['allocations'])) {
-                $this->createAllocations($projectId, $gpNumber, $data['allocations'], $totalAllocatedAmount);
-            }
-
-            return [
-                'insertedId' => $projectId,
-                'gpNumber' => $gpNumber
-            ];
-
+            $this->db->commit();
+            return ['insertedId' => $projectId, 'gpNumber' => $gpNumber];
         } catch (Exception $e) {
-            error_log("Project creation failed: " . $e->getMessage());
-            throw new Exception("Project creation failed: " . $e->getMessage());
+            if ($this->db->inTransaction()) $this->db->rollBack();
+            throw $e;
         }
     }
 
-    /**
-     * Create fund allocations for project
-     */
-    private function createAllocations($projectId, $gpNumber, $allocations, $totalAllocated) {
-        $formattedAllocations = [];
-        
-        foreach ($allocations as $alloc) {
-            $formattedAllocations[] = [
-                'id' => (string) new MongoDB\BSON\ObjectId(),
-                'headId' => $alloc['headId'] ?? null,
-                'headName' => htmlspecialchars(strip_tags($alloc['headName'] ?? '')),
-                'headType' => htmlspecialchars(strip_tags($alloc['headType'] ?? '')),
-                'sanctionedAmount' => floatval($alloc['sanctionedAmount'] ?? 0),
-                'releasedAmount' => 0,
-                'remainingAmount' => floatval($alloc['sanctionedAmount'] ?? 0),
-                'timePeriod' => htmlspecialchars(strip_tags($alloc['timePeriod'] ?? '1 Year')),
-                'bankDetails' => 'Canara Bank',
-                'status' => 'sanctioned'
-            ];
-        }
-        
-        $allocationsData = [
-            'projectId' => $projectId,
-            'gpNumber' => $gpNumber,
-            'allocations' => $formattedAllocations,
-            'totalAllocated' => $totalAllocated,
-            'totalReleased' => 0,
-            'createdAt' => new MongoDB\BSON\UTCDateTime(),
-            'updatedAt' => new MongoDB\BSON\UTCDateTime()
-        ];
-        
-        $this->db->fund_allocations->insertOne($allocationsData);
-    }
-
-    /**
-     * Get all projects with their allocations and files
-     */
     public function getAll() {
-        $pipeline = [
-            [
-                '$project' => [
-                    'sanctionedLetterFile' => 0,
-                    'extensionLetterFile'  => 0,
-                ]
-            ],
-            [
-                '$lookup' => [
-                    'from' => 'fund_allocations',
-                    'localField' => '_id',
-                    'foreignField' => 'projectId',
-                    'as' => 'allocations',
-                    'pipeline' => [
-                        [
-                            '$project' => [
-                                'projectId' => ['$toString' => '$projectId'],
-                                'gpNumber' => 1,
-                                'allocations' => 1,
-                                'totalAllocated' => 1,
-                                'totalReleased' => 1,
-                                'createdAt' => 1,
-                                'updatedAt' => 1
-                            ]
-                        ]
-                    ]
-                ]
-            ],
-            [
-                '$lookup' => [
-                    'from' => 'project_files',
-                    'let' => ['projectId' => ['$toString' => '$_id']],
-                    'pipeline' => [
-                        [
-                            '$match' => [
-                                '$expr' => ['$eq' => ['$projectId', '$$projectId']]
-                            ]
-                        ],
-                        [
-                            '$project' => [
-                                'id' => ['$toString' => '$_id'],
-                                'projectId' => 1,
-                                'gpNumber' => 1,
-                                'fileName' => 1,
-                                'storedFileName' => 1,
-                                'fileType' => 1,
-                                'filePath' => 1,
-                                'fileSize' => 1,
-                                'mimeType' => 1,
-                                'uploadedAt' => 1,
-                                'uploadedBy' => 1
-                            ]
-                        ]
-                    ],
-                    'as' => 'files'
-                ]
-            ],
-            [
-                '$sort' => ['createdAt' => -1]
-            ]
-        ];
-
-        $cursor = $this->collection->aggregate($pipeline);
-        return iterator_to_array($cursor);
+        $stmt = $this->db->query("SELECT * FROM projects ORDER BY createdAt DESC");
+        $projects = $stmt->fetchAll();
+        foreach ($projects as &$p) {
+            $p['allocations'] = $this->getAllocations($p['id']);
+            $p['files'] = $this->getFiles($p['id']);
+        }
+        return $projects;
     }
 
-    /**
-     * Search projects
-     */
-    public function search($searchTerm = "", $status = "") {
-        $filter = [];
-
-        if (!empty($searchTerm)) {
-            $filter['$or'] = [
-                ['projectName' => ['$regex' => $searchTerm, '$options' => 'i']],
-                ['gpNumber' => ['$regex' => $searchTerm, '$options' => 'i']],
-                ['piName' => ['$regex' => $searchTerm, '$options' => 'i']],
-                ['piEmail' => ['$regex' => $searchTerm, '$options' => 'i']],
-                ['department' => ['$regex' => $searchTerm, '$options' => 'i']]
-            ];
-        }
-
-        if (!empty($status)) {
-            $filter['status'] = $status;
-        }
-
-        $pipeline = [
-            ['$match' => $filter],
-            [
-                '$project' => [
-                    'sanctionedLetterFile' => 0,
-                    'extensionLetterFile'  => 0,
-                ]
-            ],
-            [
-                '$lookup' => [
-                    'from' => 'fund_allocations',
-                    'localField' => '_id',
-                    'foreignField' => 'projectId',
-                    'as' => 'allocations',
-                    'pipeline' => [
-                        [
-                            '$project' => [
-                                'projectId' => ['$toString' => '$projectId'],
-                                'gpNumber' => 1,
-                                'allocations' => 1,
-                                'totalAllocated' => 1,
-                                'totalReleased' => 1
-                            ]
-                        ]
-                    ]
-                ]
-            ],
-            [
-                '$lookup' => [
-                    'from' => 'project_files',
-                    'let' => ['projectId' => ['$toString' => '$_id']],
-                    'pipeline' => [
-                        [
-                            '$match' => [
-                                '$expr' => ['$eq' => ['$projectId', '$$projectId']]
-                            ]
-                        ],
-                        [
-                            '$project' => [
-                                'id' => ['$toString' => '$_id'],
-                                'projectId' => 1,
-                                'gpNumber' => 1,
-                                'fileName' => 1,
-                                'storedFileName' => 1,
-                                'fileType' => 1,
-                                'filePath' => 1,
-                                'fileSize' => 1,
-                                'mimeType' => 1,
-                                'uploadedAt' => 1,
-                                'uploadedBy' => 1
-                            ]
-                        ]
-                    ],
-                    'as' => 'files'
-                ]
-            ],
-            ['$sort' => ['createdAt' => -1]]
-        ];
-
-        $cursor = $this->collection->aggregate($pipeline);
-        return iterator_to_array($cursor);
-    }
-
-    /**
-     * Get project by ID
-     */
     public function getOne($id) {
-        $pipeline = [
-            ['$match' => ['_id' => new MongoDB\BSON\ObjectId($id)]],
-            [
-                '$lookup' => [
-                    'from' => 'fund_allocations',
-                    'localField' => '_id',
-                    'foreignField' => 'projectId',
-                    'as' => 'allocations',
-                    'pipeline' => [
-                        [
-                            '$project' => [
-                                'projectId' => ['$toString' => '$projectId'],
-                                'gpNumber' => 1,
-                                'allocations' => 1,
-                                'totalAllocated' => 1,
-                                'totalReleased' => 1
-                            ]
-                        ]
-                    ]
-                ]
-            ],
-            [
-                '$lookup' => [
-                    'from' => 'project_files',
-                    'let' => ['projectId' => ['$toString' => '$_id']],
-                    'pipeline' => [
-                        [
-                            '$match' => [
-                                '$expr' => ['$eq' => ['$projectId', '$$projectId']]
-                            ]
-                        ],
-                        [
-                            '$project' => [
-                                'id' => ['$toString' => '$_id'],
-                                'projectId' => 1,
-                                'gpNumber' => 1,
-                                'fileName' => 1,
-                                'storedFileName' => 1,
-                                'fileType' => 1,
-                                'filePath' => 1,
-                                'fileSize' => 1,
-                                'mimeType' => 1,
-                                'uploadedAt' => 1,
-                                'uploadedBy' => 1
-                            ]
-                        ]
-                    ],
-                    'as' => 'files'
-                ]
-            ]
-        ];
-
-        $cursor = $this->collection->aggregate($pipeline);
-        $results = iterator_to_array($cursor);
-        return !empty($results) ? $results[0] : null;
+        $stmt = $this->db->prepare("SELECT * FROM projects WHERE id = ?");
+        $stmt->execute([$id]);
+        $project = $stmt->fetch();
+        if ($project) {
+            $project['allocations'] = $this->getAllocations($id);
+            $project['files'] = $this->getFiles($id);
+        }
+        return $project;
     }
 
-    /**
-     * Update project
-     */
+    private function getAllocations($projectId) {
+        $stmt = $this->db->prepare("SELECT * FROM head_allocations WHERE projectId = ?");
+        $stmt->execute([$projectId]);
+        return $stmt->fetchAll();
+    }
+
+    private function getFiles($projectId) {
+        $stmt = $this->db->prepare("SELECT * FROM project_files WHERE projectId = ?");
+        $stmt->execute([$projectId]);
+        return $stmt->fetchAll();
+    }
+
+    public function search($searchTerm = "", $status = "") {
+        $sql = "SELECT * FROM projects WHERE 1=1";
+        $params = [];
+        if (!empty($searchTerm)) {
+            $sql .= " AND (projectName LIKE ? OR gpNumber LIKE ? OR piName LIKE ? OR piEmail LIKE ?)";
+            $params = array_merge($params, ["%$searchTerm%", "%$searchTerm%", "%$searchTerm%", "%$searchTerm%"]);
+        }
+        if (!empty($status)) {
+            $sql .= " AND status = ?";
+            $params[] = $status;
+        }
+        $sql .= " ORDER BY createdAt DESC";
+        $stmt = $this->db->prepare($sql);
+        $stmt->execute($params);
+        $projects = $stmt->fetchAll();
+        foreach ($projects as &$p) {
+            $p['allocations'] = $this->getAllocations($p['id']);
+        }
+        return $projects;
+    }
+
     public function update($id, $data) {
-        $updateData = [
-            '$set' => [
-                'updatedAt' => new MongoDB\BSON\UTCDateTime()
-            ]
-        ];
-
-        if (isset($data['modeOfProject'])) {
-            $updateData['$set']['modeOfProject'] = htmlspecialchars(strip_tags($data['modeOfProject']));
-        }
-        if (isset($data['projectName'])) {
-            $updateData['$set']['projectName'] = htmlspecialchars(strip_tags($data['projectName']));
-        }
-        if (isset($data['projectAgencyName'])) {
-            $updateData['$set']['projectAgencyName'] = htmlspecialchars(strip_tags($data['projectAgencyName']));
-        }
-        if (isset($data['sanctionOrderNo'])) {
-            $updateData['$set']['sanctionOrderNo'] = htmlspecialchars(strip_tags($data['sanctionOrderNo']));
-        }
-        if (isset($data['nameOfScheme'])) {
-            $updateData['$set']['nameOfScheme'] = htmlspecialchars(strip_tags($data['nameOfScheme']));
-        }
-        if (isset($data['piName'])) {
-            $updateData['$set']['piName'] = htmlspecialchars(strip_tags($data['piName']));
-        }
-        if (isset($data['piEmail'])) {
-            $updateData['$set']['piEmail'] = htmlspecialchars(strip_tags($data['piEmail']));
-        }
-        if (isset($data['department'])) {
-            $updateData['$set']['department'] = htmlspecialchars(strip_tags($data['department']));
-        }
-        if (isset($data['totalSanctionedAmount'])) {
-            $updateData['$set']['totalSanctionedAmount'] = floatval($data['totalSanctionedAmount']);
-        }
-        if (isset($data['totalReleasedAmount'])) {
-            $updateData['$set']['totalReleasedAmount'] = floatval($data['totalReleasedAmount']);
-        }
-        if (isset($data['amountBookedByPI'])) {
-            $updateData['$set']['amountBookedByPI'] = floatval($data['amountBookedByPI']);
-        }
-        if (isset($data['actualExpenditure'])) {
-            $updateData['$set']['actualExpenditure'] = floatval($data['actualExpenditure']);
-        }
-        if (isset($data['status'])) {
-            $updateData['$set']['status'] = htmlspecialchars(strip_tags($data['status']));
-        }
+        $now = date('Y-m-d H:i:s');
+        $sql = "UPDATE projects SET updatedAt = ?";
+        $params = [$now];
         
-        if (isset($data['gpNumber'])) {
-            if (!preg_match('/^GP\/\d{2}-\d{2}\/\d{3}$/', $data['gpNumber'])) {
-                throw new Exception("Invalid GP Number format. Expected: GP/YY-YY/XXX");
+        $fields = ['projectName', 'piName', 'piEmail', 'department', 'status', 'totalSanctionedAmount'];
+        foreach ($fields as $f) {
+            if (isset($data[$f])) {
+                $sql .= ", $f = ?";
+                $params[] = $data[$f];
             }
-            $updateData['$set']['gpNumber'] = $data['gpNumber'];
         }
-
-        if (isset($data['projectStartYear']) && isset($data['projectStartMonth']) && isset($data['projectStartDate'])) {
-            $startDate = new DateTime(
-                $data['projectStartYear'] . '-' . 
-                str_pad($data['projectStartMonth'], 2, '0', STR_PAD_LEFT) . '-' . 
-                str_pad($data['projectStartDate'], 2, '0', STR_PAD_LEFT)
-            );
-            $updateData['$set']['projectStartDate'] = new MongoDB\BSON\UTCDateTime($startDate->getTimestamp() * 1000);
-        }
-
-        if (isset($data['projectEndYear']) && isset($data['projectEndMonth']) && isset($data['projectEndDate'])) {
-            $endDate = new DateTime(
-                $data['projectEndYear'] . '-' . 
-                str_pad($data['projectEndMonth'], 2, '0', STR_PAD_LEFT) . '-' . 
-                str_pad($data['projectEndDate'], 2, '0', STR_PAD_LEFT)
-            );
-            $updateData['$set']['projectEndDate'] = new MongoDB\BSON\UTCDateTime($endDate->getTimestamp() * 1000);
-        }
-
-        if (isset($data['totalYears'])) {
-            $updateData['$set']['totalYears'] = floatval($data['totalYears']);
-        }
-
-        $result = $this->collection->updateOne(
-            ['_id' => new MongoDB\BSON\ObjectId($id)],
-            $updateData
-        );
-
-        return $result->getModifiedCount() > 0 || $result->getMatchedCount() > 0;
+        $sql .= " WHERE id = ?";
+        $params[] = $id;
+        
+        $stmt = $this->db->prepare($sql);
+        return $stmt->execute($params);
     }
 
-    /**
-     * Delete project
-     */
     public function delete($id) {
-        $result = $this->collection->deleteOne(['_id' => new MongoDB\BSON\ObjectId($id)]);
-        
-        if ($result->getDeletedCount() > 0) {
-            $this->db->fund_allocations->deleteMany(['projectId' => $id]);
-            $this->db->project_files->deleteMany(['projectId' => $id]);
-        }
-        
-        return $result->getDeletedCount() > 0;
+        $this->db->beginTransaction();
+        $this->db->prepare("DELETE FROM projects WHERE id = ?")->execute([$id]);
+        $this->db->prepare("DELETE FROM head_allocations WHERE projectId = ?")->execute([$id]);
+        $this->db->prepare("DELETE FROM project_heads_list WHERE projectId = ?")->execute([$id]);
+        return $this->db->commit();
     }
 
     /**
-     * Format document for API response.
-     *
-     * FIXED: The old version called ->toDateTime() unconditionally, which crashes
-     * when a date field contains a plain string (e.g. saved by the old extend-project.php).
-     * Now we check instanceof before calling toDateTime(), so stale string-dates
-     * are passed through as-is and never cause a fatal error.
+     * Recalculates amountBookedByPI and actual_exp for a project and all its head allocations.
+     * Rule: Booked = SUM(requestedAmount) for status != 'rejected'
+     *       Actual = SUM(actual_exp) for status = 'approved'
      */
+    public function syncFinancialTotals($projectId) {
+        $now = date('Y-m-d H:i:s');
+        
+        // 1. Recalculate Project Level Totals
+        // Booked = Sum(requestedAmount) for all non-rejected requests
+        $stmtBooked = $this->db->prepare("SELECT SUM(requestedAmount) FROM budget_requests WHERE projectId = ? AND status != 'rejected'");
+        $stmtBooked->execute([$projectId]);
+        $bookedTotal = floatval($stmtBooked->fetchColumn() ?: 0);
+
+        // Actual = Sum(actual_exp) for all non-rejected requests (includes pending)
+        $stmtActual = $this->db->prepare("SELECT SUM(actual_exp) FROM budget_requests WHERE projectId = ? AND status != 'rejected'");
+        $stmtActual->execute([$projectId]);
+        $actualTotal = floatval($stmtActual->fetchColumn() ?: 0);
+
+        // Update Project Table
+        $this->db->prepare("UPDATE projects SET amountBookedByPI = ?, actual_exp = ?, updatedAt = ? WHERE id = ?")
+                 ->execute([$bookedTotal, $actualTotal, $now, $projectId]);
+
+        // 2. Recalculate all Head Level Totals for this project
+        $stmtHeads = $this->db->prepare("SELECT id, headId, headName FROM head_allocations WHERE projectId = ?");
+        $stmtHeads->execute([$projectId]);
+        $heads = $stmtHeads->fetchAll();
+
+        foreach ($heads as $h) {
+            $hId   = $h['headId'];
+            $hName = $h['headName'];
+            $haId  = $h['id'];
+
+            // Booked for this head (status != 'rejected')
+            $stmtHBooked = $this->db->prepare("SELECT SUM(requestedAmount) FROM budget_requests WHERE projectId = ? AND (headId = ? OR headName = ?) AND status != 'rejected'");
+            $stmtHBooked->execute([$projectId, $hId, $hName]);
+            $hBooked = floatval($stmtHBooked->fetchColumn() ?: 0);
+
+            // Actual for this head (status != 'rejected')
+            $stmtHActual = $this->db->prepare("SELECT SUM(actual_exp) FROM budget_requests WHERE projectId = ? AND (headId = ? OR headName = ?) AND status != 'rejected'");
+            $stmtHActual->execute([$projectId, $hId, $hName]);
+            $hActual = floatval($stmtHActual->fetchColumn() ?: 0);
+
+            // Update head_allocations
+            $this->db->prepare("UPDATE head_allocations SET bookedAmount = ?, actual_exp = ?, updatedAt = ? WHERE id = ?")
+                     ->execute([$hBooked, $hActual, $now, $haId]);
+        }
+
+        return ['amountBookedByPI' => $bookedTotal, 'actual_exp' => $actualTotal];
+    }
+
     public static function formatDocument($doc) {
-        if ($doc === null) return null;
-
-        $formatted = (array) $doc;
-        $formatted['id'] = (string) $doc['_id'];
-        unset($formatted['_id']);
-
-        // All date fields that might exist on a project document
-        $dateFields = [
-            'createdAt',
-            'updatedAt',
-            'projectStartDate',
-            'projectEndDate',
-            'originalEndDate',
-            'sanctionedLetterUploadedAt',
-            'extensionLetterUploadedAt',
-            'lastExtendedAt',
-        ];
-
-        foreach ($dateFields as $field) {
-            if (!isset($formatted[$field]) || $formatted[$field] === null) {
-                continue;
-            }
-
-            $val = $formatted[$field];
-
-            if ($val instanceof MongoDB\BSON\UTCDateTime) {
-                // Normal case — convert to a readable date string
-                $formatted[$field] = $val->toDateTime()->format('Y-m-d H:i:s');
-            }
-            // If it's already a string (legacy data), leave it untouched.
-            // Any other unexpected type is also left untouched — no crash.
+        if (!$doc) return null;
+        if (isset($doc['allocations'])) {
+            foreach ($doc['allocations'] as &$a) { if (isset($a['id'])) $a['id'] = (string)$a['id']; }
         }
-
-        // Format allocations if present
-        if (isset($formatted['allocations']) && is_array($formatted['allocations'])) {
-            $formatted['allocations'] = array_map(function($alloc) {
-                if (isset($alloc['_id'])) {
-                    $alloc['id'] = (string) $alloc['_id'];
-                    unset($alloc['_id']);
-                }
-                return $alloc;
-            }, $formatted['allocations']);
-        }
-
-        // Format files if present
-        if (isset($formatted['files']) && is_array($formatted['files'])) {
-            $formatted['files'] = array_map(function($file) {
-                if (isset($file['_id'])) {
-                    unset($file['_id']);
-                }
-                if (isset($file['uploadedAt']) && $file['uploadedAt'] instanceof MongoDB\BSON\UTCDateTime) {
-                    $file['uploadedAt'] = $file['uploadedAt']->toDateTime()->format('Y-m-d H:i:s');
-                }
-                return $file;
-            }, $formatted['files']);
-        }
-
-        return $formatted;
+        return $doc;
     }
 }
 ?>

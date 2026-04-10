@@ -1,24 +1,10 @@
 <?php
 /**
- * release-funds-headwise.php — v6
- *
- * PERMANENT HISTORY GUARANTEE:
- *   Every release event is now written to THREE places atomically:
- *     1. fund_releases            — primary operational record
- *     2. head_allocations         — per-head running totals
- *     3. release_audit_log        — permanent immutable ledger
- *                                   (never deleted even when balance = 0)
- *
- *   This means the report and dialog boxes always show correct released
- *   amounts, even after remaining balance reaches ₹0 and fund_allocations
- *   is redistributed.
- *
- * Also fixes totalReleasedAmount on the project document so the table
- * cell always shows the correct figure.
+ * release-funds-headwise.php — v7 (CORS FIX)
  */
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: POST, OPTIONS');
-header('Access-Control-Allow-Headers: Content-Type, Authorization');
+header('Access-Control-Allow-Headers: Content-Type');
 header('Content-Type: application/json');
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit(); }
@@ -40,34 +26,37 @@ $letterNumber = trim($input['letterNumber'] ?? '');
 $letterDate   = trim($input['letterDate']   ?? '');
 $remarks      = trim($input['remarks']      ?? '');
 $releasedBy   = trim($input['releasedBy']   ?? 'Admin');
-$releases     = $input['releases'] ?? [];     // array of {headId, headName, headType, amount}
+$releases     = $input['releases'] ?? [];
 
 if (!$projectId || empty($releases)) {
     echo json_encode(['success' => false, 'message' => 'projectId and releases are required']); exit();
 }
 
 try {
-    $db  = getMongoDBConnection();
-    $now = new MongoDB\BSON\UTCDateTime();
+    $db = getMySQLConnection();
+    $db->beginTransaction();
 
-    /* ── 1. Validate project ─────────────────────────────────────────────── */
-    $project = $db->projects->findOne(['_id' => new MongoDB\BSON\ObjectId($projectId)]);
-    if (!$project) {
-        echo json_encode(['success' => false, 'message' => 'Project not found']); exit();
-    }
+    /* ── 1. Fetch Project data ───────────────────────────────────────────── */
+    $stmtProj = $db->prepare("SELECT projectName, gpNumber, totalSanctionedAmount, totalReleasedAmount FROM projects WHERE id = ? FOR UPDATE");
+    $stmtProj->execute([$projectId]);
+    $project = $stmtProj->fetch();
+
+    if (!$project) throw new Exception('Project not found');
 
     $totalSanctioned = floatval($project['totalSanctionedAmount'] ?? 0);
     $totalReleased   = floatval($project['totalReleasedAmount']   ?? 0);
 
     /* ── 2. Build release number ─────────────────────────────────────────── */
-    $releaseCount  = $db->fund_releases->countDocuments(['projectId' => $projectId]);
-    $releaseNumber = 'REL/' . ($project['gpNumber'] ?? $gpNumber) . '/' .
-                     str_pad($releaseCount + 1, 3, '0', STR_PAD_LEFT);
+    $stmtCount = $db->prepare("SELECT COUNT(*) FROM fund_releases WHERE projectId = ?");
+    $stmtCount->execute([$projectId]);
+    $releaseCount = $stmtCount->fetchColumn();
+    $releaseNumber = 'REL/' . ($project['gpNumber'] ?: $gpNumber) . '/' . str_pad($releaseCount + 1, 3, '0', STR_PAD_LEFT);
 
-    /* ── 3. Validate each head release amount ────────────────────────────── */
     $totalThisRelease = 0;
     $validatedReleases = [];
+    $now = date('Y-m-d H:i:s');
 
+    /* ── 3. Validate & Accumulate ────────────────────────────────────────── */
     foreach ($releases as $rel) {
         $headId   = trim($rel['headId']   ?? '');
         $headName = trim($rel['headName'] ?? '');
@@ -76,235 +65,75 @@ try {
 
         if ($amount <= 0) continue;
 
-        // Validate: cumulative released cannot exceed sanctioned for this head
-        $headAlloc = $db->head_allocations->findOne([
-            'projectId' => $projectId,
-            '$or' => [['headId' => $headId], ['headName' => $headName]],
-        ]);
-        if ($headAlloc) {
-            $headSanctioned = floatval($headAlloc['sanctionedAmount'] ?? 0);
-            $headReleased   = floatval($headAlloc['releasedAmount']   ?? 0);
-            $headAvail      = $headSanctioned - $headReleased;
+        // Fetch current head allocation
+        $stmtAlloc = $db->prepare("SELECT sanctionedAmount, releasedAmount FROM head_allocations WHERE projectId = ? AND (headId = ? OR headName = ?) FOR UPDATE");
+        $stmtAlloc->execute([$projectId, $headId, $headName]);
+        $hAlloc = $stmtAlloc->fetch();
+
+        $headSanctioned = 0;
+        if ($hAlloc) {
+            $headSanctioned = floatval($hAlloc['sanctionedAmount']);
+            $headAvail = $headSanctioned - floatval($hAlloc['releasedAmount']);
             if ($amount > $headAvail + 0.01) {
-                echo json_encode([
-                    'success' => false,
-                    'message' => "Release amount for \"{$headName}\" (₹" . number_format($amount, 2) .
-                                 ") exceeds available sanctioned balance (₹" . number_format($headAvail, 2) . ")",
-                ]); exit();
+                throw new Exception("Release amount for \"{$headName}\" (₹" . number_format($amount, 2) . ") exceeds available sanctioned balance (₹" . number_format($headAvail, 2) . ")");
             }
         }
 
         $totalThisRelease += $amount;
         $validatedReleases[] = [
-            'headId'   => $headId,
-            'headName' => $headName,
-            'headType' => $headType,
-            'amount'   => $amount,
+            'headId' => $headId, 'headName' => $headName, 'headType' => $headType, 'amount' => $amount, 'sanctionedAmount' => $headSanctioned
         ];
     }
 
-    if (empty($validatedReleases)) {
-        echo json_encode(['success' => false, 'message' => 'No valid release amounts provided']); exit();
+    if ($totalThisRelease > ($totalSanctioned - $totalReleased) + 0.01) {
+        throw new Exception("Total release exceeds yet-to-release project balance");
     }
 
-    // Cannot release more than remaining sanctioned
-    $yetToRelease = $totalSanctioned - $totalReleased;
-    if ($totalThisRelease > $yetToRelease + 0.01) {
-        echo json_encode([
-            'success' => false,
-            'message' => "Total release (₹" . number_format($totalThisRelease, 2) .
-                         ") exceeds yet-to-release balance (₹" . number_format($yetToRelease, 2) . ")",
-        ]); exit();
+    /* ── 4. Insert Fund Release ──────────────────────────────────────────── */
+    $relId = bin2hex(random_bytes(12));
+    $stmtRel = $db->prepare("INSERT INTO fund_releases (id, projectId, gpNumber, releaseNumber, letterNumber, letterDate, totalReleasedAmount, remarks, releasedBy, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    $stmtRel->execute([$relId, $projectId, $project['gpNumber'], $releaseNumber, $letterNumber, $letterDate, $totalThisRelease, $remarks, $releasedBy, $now, $now]);
+
+    foreach ($validatedReleases as $vr) {
+        $db->prepare("INSERT INTO headwise_releases (fundReleaseId, headId, headName, headType, sanctionedAmount, releaseAmount) VALUES (?, ?, ?, ?, ?, ?)")
+           ->execute([$relId, $vr['headId'], $vr['headName'], $vr['headType'], $vr['sanctionedAmount'], $vr['amount']]);
+
+        /* ── 5. Permanent Audit Log ────────────────────────────────────────── */
+        $auditSql = "INSERT INTO release_audit_log (projectId, gpNumber, projectName, auditKey, releaseNumber, letterNumber, letterDate, headId, headName, headType, amountReleased, releasedBy, remarks, releaseDate, loggedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        $db->prepare($auditSql)->execute([
+            $projectId, $project['gpNumber'], $project['projectName'], $releaseNumber.'::'.$vr['headId'],
+            $releaseNumber, $letterNumber, $letterDate, $vr['headId'], $vr['headName'], $vr['headType'],
+            $vr['amount'], $releasedBy, $remarks, $now, $now
+        ]);
+
+        /* ── 6. Update head_allocations ────────────────────────────────────── */
+        $db->prepare("UPDATE head_allocations SET releasedAmount = releasedAmount + ?, updatedAt = ?, status = IF(releasedAmount >= sanctionedAmount, 'fully_released', 'partially_released') WHERE projectId = ? AND (headId = ? OR headName = ?)")
+           ->execute([$vr['amount'], $now, $projectId, $vr['headId'], $vr['headName']]);
+
+        /* ── 7. Sync fund_allocation_items ─────────────────────────────────── */
+        $db->prepare("UPDATE fund_allocation_items SET releasedAmount = releasedAmount + ?, status = IF(releasedAmount >= sanctionedAmount, 'fully_released', 'partially_released') WHERE headId = ? OR headName = ?")
+           ->execute([$vr['amount'], $vr['headId'], $vr['headName']]);
     }
 
-    /* ── 4. Write to fund_releases (primary operational record) ─────────── */
-    $fundReleaseDoc = [
-        'projectId'      => $projectId,
-        'gpNumber'       => $gpNumber ?: ($project['gpNumber'] ?? ''),
-        'releaseNumber'  => $releaseNumber,
-        'letterNumber'   => $letterNumber,
-        'letterDate'     => $letterDate ? new MongoDB\BSON\UTCDateTime(strtotime($letterDate) * 1000) : $now,
-        'totalReleased'  => $totalThisRelease,
-        'remarks'        => $remarks,
-        'releasedBy'     => $releasedBy,
-        'headwiseReleases' => array_map(fn($r) => [
-            'headId'   => $r['headId'],
-            'headName' => $r['headName'],
-            'headType' => $r['headType'],
-            'amount'   => $r['amount'],
-        ], $validatedReleases),
-        'releasedAt'     => $now,
-        'createdAt'      => $now,
-    ];
-    $db->fund_releases->insertOne($fundReleaseDoc);
+    /* ── 8. Update Project Total ─────────────────────────────────────────── */
+    $db->prepare("UPDATE projects SET totalReleasedAmount = totalReleasedAmount + ?, updatedAt = ? WHERE id = ?")
+       ->execute([$totalThisRelease, $now, $projectId]);
 
-    /* ── 5. Write permanent audit log entries (one per head) ─────────────── */
-    // These are NEVER deleted. They survive balance resets, reallocations, etc.
-    $auditEntries = [];
-    foreach ($validatedReleases as $rel) {
-        $auditKey = $releaseNumber . '::' . ($rel['headId'] ?: $rel['headName']);
-        $auditEntry = [
-            'projectId'      => $projectId,
-            'gpNumber'       => $gpNumber ?: ($project['gpNumber'] ?? ''),
-            'projectName'    => $project['projectName'] ?? '',
-            '_auditKey'      => $auditKey,
-            'releaseNumber'  => $releaseNumber,
-            'letterNumber'   => $letterNumber,
-            'letterDate'     => $letterDate ?: null,
-            'headId'         => $rel['headId'],
-            'headName'       => $rel['headName'],
-            'headType'       => $rel['headType'],
-            'amountReleased' => $rel['amount'],
-            'releasedBy'     => $releasedBy,
-            'remarks'        => $remarks,
-            'releaseDate'    => $now,
-            'loggedAt'       => $now,
-            '_source'        => 'release-funds-headwise',
-            '_immutable'     => true,   // marker — never delete documents with this flag
-        ];
-        $db->release_audit_log->insertOne($auditEntry);
-        $auditEntries[] = $auditEntry;
-    }
-
-    /* ── 6. Update head_allocations per head ─────────────────────────────── */
-    foreach ($validatedReleases as $rel) {
-        $filter = [
-            'projectId' => $projectId,
-            '$or' => [
-                ['headId'   => $rel['headId']],
-                ['headName' => $rel['headName']],
-            ],
-        ];
-        $existing = $db->head_allocations->findOne($filter);
-
-        if ($existing) {
-            $newReleased = floatval($existing['releasedAmount'] ?? 0) + $rel['amount'];
-            $sanctioned  = floatval($existing['sanctionedAmount'] ?? 0);
-
-            // Append to the head's own release history array
-            $historyEntry = [
-                'releaseNumber' => $releaseNumber,
-                'letterNumber'  => $letterNumber,
-                'letterDate'    => $letterDate ?: null,
-                'releaseAmount' => $rel['amount'],
-                'releasedBy'    => $releasedBy,
-                'remarks'       => $remarks,
-                'releasedAt'    => date('Y-m-d H:i:s'),
-            ];
-
-            $db->head_allocations->updateOne(
-                ['_id' => $existing['_id']],
-                [
-                    '$inc'  => ['releasedAmount' => $rel['amount']],
-                    '$set'  => [
-                        'status'    => ($newReleased >= $sanctioned) ? 'fully_released' : 'partially_released',
-                        'updatedAt' => $now,
-                    ],
-                    '$push' => ['releaseHistory' => $historyEntry],
-                ]
-            );
-        } else {
-            // Create head_allocation record if it doesn't exist yet
-            $db->head_allocations->insertOne([
-                'projectId'      => $projectId,
-                'gpNumber'       => $gpNumber ?: ($project['gpNumber'] ?? ''),
-                'headId'         => $rel['headId'],
-                'headName'       => $rel['headName'],
-                'headType'       => $rel['headType'],
-                'sanctionedAmount'=> 0,   // will be set by update-project-allocations.php
-                'releasedAmount' => $rel['amount'],
-                'bookedAmount'   => 0,
-                'actualExpenditure' => 0,
-                'status'         => 'partially_released',
-                'releaseHistory' => [[
-                    'releaseNumber' => $releaseNumber,
-                    'letterNumber'  => $letterNumber,
-                    'letterDate'    => $letterDate ?: null,
-                    'releaseAmount' => $rel['amount'],
-                    'releasedBy'    => $releasedBy,
-                    'remarks'       => $remarks,
-                    'releasedAt'    => date('Y-m-d H:i:s'),
-                ]],
-                'createdAt'      => $now,
-                'updatedAt'      => $now,
-            ]);
-        }
-    }
-
-    /* ── 7. Update fund_allocations head entries ──────────────────────────── */
-    $allocDoc = $db->fund_allocations->findOne(['projectId' => $projectId]);
-    if ($allocDoc && isset($allocDoc['allocations'])) {
-        $allocations = iterator_to_array($allocDoc['allocations']);
-        $changed = false;
-
-        foreach ($allocations as &$alloc) {
-            foreach ($validatedReleases as $rel) {
-                $allocId  = (string)($alloc['_id'] ?? $alloc['id'] ?? '');
-                $hId      = (string)($alloc['headId'] ?? '');
-                $hName    = (string)($alloc['headName'] ?? '');
-
-                $matches = ($allocId === $rel['headId'])
-                        || ($hId    === $rel['headId'])
-                        || ($hName  === $rel['headName']);
-                if (!$matches) continue;
-
-                $alloc['releasedAmount']  = floatval($alloc['releasedAmount'] ?? 0) + $rel['amount'];
-                $alloc['remainingAmount'] = max(0,
-                    floatval($alloc['sanctionedAmount'] ?? 0) - $alloc['releasedAmount']
-                );
-                $alloc['status'] = ($alloc['releasedAmount'] >= floatval($alloc['sanctionedAmount'] ?? 0))
-                    ? 'fully_released' : 'partially_released';
-                $changed = true;
-                break;
-            }
-        }
-        unset($alloc);
-
-        if ($changed) {
-            $db->fund_allocations->updateOne(
-                ['projectId' => $projectId],
-                ['$set' => [
-                    'allocations'  => $allocations,
-                    'totalReleased'=> floatval($allocDoc['totalReleased'] ?? 0) + $totalThisRelease,
-                    'updatedAt'    => $now,
-                ]]
-            );
-        }
-    }
-
-    /* ── 8. Update project.totalReleasedAmount ────────────────────────────── */
-    // Re-aggregate from fund_releases to get the true total (most accurate)
-    $relAgg = iterator_to_array($db->fund_releases->aggregate([
-        ['$match'  => ['projectId' => $projectId]],
-        ['$unwind' => '$headwiseReleases'],
-        ['$group'  => ['_id' => null, 'total' => ['$sum' => '$headwiseReleases.amount']]],
-    ]));
-    $newTotal = !empty($relAgg) ? floatval($relAgg[0]['total']) : ($totalReleased + $totalThisRelease);
-
-    $db->projects->updateOne(
-        ['_id' => new MongoDB\BSON\ObjectId($projectId)],
-        ['$set' => [
-            'totalReleasedAmount' => $newTotal,
-            'updatedAt'           => $now,
-        ]]
-    );
+    $db->commit();
 
     echo json_encode([
         'success' => true,
-        'message' => 'Funds released successfully. History permanently recorded.',
-        'data'    => [
-            'projectId'          => $projectId,
-            'releaseNumber'      => $releaseNumber,
-            'totalThisRelease'   => $totalThisRelease,
-            'newTotalReleased'   => $newTotal,
-            'yetToRelease'       => max(0, $totalSanctioned - $newTotal),
-            'headsReleased'      => count($validatedReleases),
-            'auditLogEntries'    => count($auditEntries),
-        ],
+        'message' => 'Funds released successfully. Relational data synchronized.',
+        'data' => [
+            'releaseNumber' => $releaseNumber,
+            'totalThisRelease' => $totalThisRelease,
+            'headsReleased' => count($validatedReleases)
+        ]
     ]);
 
 } catch (Exception $e) {
-    error_log("release-funds-headwise v6: " . $e->getMessage());
+    if (isset($db) && $db->inTransaction()) $db->rollBack();
+    error_log("release-funds-headwise error: " . $e->getMessage());
     http_response_code(500);
     echo json_encode(['success' => false, 'message' => $e->getMessage()]);
 }

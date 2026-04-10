@@ -1,65 +1,77 @@
 <?php
 require_once __DIR__ . '/../vendor/autoload.php';
 
-use MongoDB\Client;
 use Dotenv\Dotenv;
 
-// Load .env from project root
+// 1. Load Environmental Variables
 try {
     $dotenv = Dotenv::createImmutable(dirname(__DIR__));
     $dotenv->safeLoad();
 } catch (Exception $e) {
-    // Ignore dotenv exceptions in production since we use system environment variables
+    // Dotenv errors allowed in production if vars are in system environment
 }
 
-
-class Database {
-
-    private $atlas_uri;
+/**
+ * MySQL Database Connector using PDO
+ */
+class MySQLDatabase {
+    private $host;
     private $db_name;
-    private $client;
+    private $username;
+    private $password;
+    private $conn;
 
     public function __construct() {
-        $this->atlas_uri = $_ENV['MONGODB_ATLAS_URI'] ?? '';
-        $this->db_name   = $_ENV['MONGODB_DB_NAME'] ?? 'research_projects';
-        $this->connect();
+        $this->host     = $_ENV['MYSQL_HOST'] ?? 'localhost';
+        $this->db_name  = $_ENV['MYSQL_DB_NAME'] ?? 'ifms_db';
+        $this->username = $_ENV['MYSQL_USER'] ?? 'root';
+        $this->password = $_ENV['MYSQL_PASS'] ?? '';
     }
 
-    private function connect() {
+    public function connect() {
+        if ($this->conn !== null) return $this->conn;
+
         try {
-            if (empty($this->atlas_uri)) {
-                die(json_encode([
-                    "success" => false,
-                    "message" => "MongoDB Atlas URI not found in .env file"
-                ]));
-            }
+            $dsn = "mysql:host={$this->host};dbname={$this->db_name};charset=utf8mb4";
+            $options = [
+                PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                PDO::ATTR_EMULATE_PREPARES   => false,
+            ];
 
-            $this->client = new Client($this->atlas_uri);
-            $this->client->listDatabases();
-
-            error_log("✅ MongoDB connected successfully");
-
-        } catch (Exception $e) {
-            error_log("❌ MongoDB connection failed: " . $e->getMessage());
+            $this->conn = new PDO($dsn, $this->username, $this->password, $options);
+            return $this->conn;
+        } catch (PDOException $e) {
+            error_log("❌ MySQL connection failed: " . $e->getMessage());
+            header('Content-Type: application/json');
             die(json_encode([
-                "success" => false,
-                "message" => "MongoDB connection failed"
+                "success" => false, 
+                "message" => "Database connection failed. Check your MySQL configuration."
             ]));
         }
     }
 
-    public function getDatabase() {
-        return $this->client->{$this->db_name};
+    public function getConnection() {
+        return $this->connect();
     }
 }
 
-function getMongoDBConnection() {
-    static $db = null;
-
-    if ($db === null) {
-        $database = new Database();
-        $db = $database->getDatabase();
+/**
+ * Shared MySQL connection instance
+ */
+function getMySQLConnection() {
+    static $mysql_db = null;
+    if ($mysql_db === null) {
+        $database = new MySQLDatabase();
+        $mysql_db = $database->getConnection();
     }
-
-    return $db;
+    return $mysql_db;
 }
+
+/**
+ * Legacy compatibility: Redirect getMongoDBConnection to MySQL if needed, 
+ * or purely migrate all files to getMySQLConnection which we have done.
+ * We'll keep a dummy or just remove it.
+ * REMOVED MongoDB logic to ensure no legacy code accidentally triggers it.
+ */
+?>

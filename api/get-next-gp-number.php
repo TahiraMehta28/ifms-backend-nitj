@@ -11,78 +11,53 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 
 require_once __DIR__ . '/../config/database.php';
 
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit(); }
+
 try {
-    $db = getMongoDBConnection();
+    $db = getMySQLConnection();
+
+    // Determine current financial year (April to March)
+    $now = new DateTime();
+    $mon = (int)$now->format('n');
+    $year = (int)$now->format('Y');
     
-    if (!$db) {
-        throw new Exception('Failed to connect to MongoDB');
-    }
-    
-    // Determine current financial year
-    $currentDate = new DateTime();
-    $currentMonth = (int) $currentDate->format('n'); // 1-12
-    $currentYear = (int) $currentDate->format('Y');
-    
-    if ($currentMonth >= 4) {
-        // April onwards - current year to next year
-        $fyStart = $currentYear;
-        $fyEnd = $currentYear + 1;
+    if ($mon >= 4) {
+        $fyS = $year; $fyE = $year + 1;
     } else {
-        // January to March - previous year to current year
-        $fyStart = $currentYear - 1;
-        $fyEnd = $currentYear;
+        $fyS = $year - 1; $fyE = $year;
     }
     
-    // Format: YY-YY (e.g., 25-26)
-    $financialYear = sprintf(
-        "%02d-%02d",
-        $fyStart % 100,
-        $fyEnd % 100
-    );
+    $fy = sprintf("%02d-%02d", $fyS % 100, $fyE % 100);
     
-    // Find the last GP number for this financial year
-    // Use regex to match GP/YY-YY/XXX format
-    $regex = new MongoDB\BSON\Regex("^GP/{$financialYear}/", 'i');
+    // Find highest sequence: GP/FY/XXX
+    // MySQL: ORDER BY gpNumber DESC is usually enough if formatted consistently
+    $stmt = $db->prepare("SELECT gpNumber FROM projects WHERE gpNumber LIKE ? ORDER BY gpNumber DESC LIMIT 1");
+    $stmt->execute(["GP/{$fy}/%"]);
+    $last = $stmt->fetch();
     
-    $lastProject = $db->projects->findOne(
-        ['gpNumber' => $regex],
-        [
-            'sort' => ['gpNumber' => -1],
-            'projection' => ['gpNumber' => 1]
-        ]
-    );
-    
-    $newNumber = 1; // Default starting number
-    
-    if ($lastProject && isset($lastProject['gpNumber'])) {
-        // Extract sequence number from GP/YY-YY/XXX
-        $parts = explode('/', $lastProject['gpNumber']);
+    $nextIdx = 1;
+    if ($last) {
+        $parts = explode('/', $last['gpNumber']);
         if (count($parts) === 3) {
-            $lastNumber = intval($parts[2]);
-            $newNumber = $lastNumber + 1;
+            $nextIdx = intval($parts[2]) + 1;
         }
     }
     
-    // Generate new GP number
-    $newGPNumber = sprintf("GP/%s/%03d", $financialYear, $newNumber);
+    $newGP = sprintf("GP/%s/%03d", $fy, $nextIdx);
     
     echo json_encode([
         'success' => true,
         'data' => [
-            'gpNumber' => $newGPNumber,
-            'financialYear' => $financialYear,
-            'sequenceNumber' => $newNumber,
-            'lastGPNumber' => $lastProject['gpNumber'] ?? null
+            'gpNumber' => $newGP,
+            'financialYear' => $fy,
+            'sequenceNumber' => $nextIdx,
+            'lastGPNumber' => $last['gpNumber'] ?? null
         ]
     ]);
     
 } catch (Exception $e) {
-    error_log("Get Next GP Number Error: " . $e->getMessage());
-    
     http_response_code(500);
-    echo json_encode([
-        'success' => false,
-        'message' => $e->getMessage()
-    ]);
+    error_log("get-next-gp-number: " . $e->getMessage());
+    echo json_encode(['success' => false, 'message' => $e->getMessage()]);
 }
 ?>

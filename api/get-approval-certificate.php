@@ -14,6 +14,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit();
 
 require_once __DIR__ . '/../config/database.php';
 
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit(); }
+
 $requestId = trim($_GET['requestId'] ?? '');
 if (!$requestId) {
     echo json_encode(['success' => false, 'message' => 'requestId required']); exit();
@@ -43,143 +45,80 @@ function numberToWords(float $amount): string {
     return trim($r) . ' Only';
 }
 
-// ── Format a UTCDateTime or ISO string to dd.mm.yyyy ─────────────────────────
 function fmtDate($val): string {
     if (empty($val)) return '';
-    if ($val instanceof MongoDB\BSON\UTCDateTime) {
-        return $val->toDateTime()->format('d.m.Y');
-    }
     try { return (new DateTime((string)$val))->format('d.m.Y'); }
     catch (Exception $e) { return (string)$val; }
 }
 
 try {
-    $db  = getMongoDBConnection();
-    $req = $db->budget_requests->findOne(['_id' => new MongoDB\BSON\ObjectId($requestId)]);
+    $db = getMySQLConnection();
+    
+    // 1. Fetch request and joined project
+    $stmt = $db->prepare("
+        SELECT r.*, p.totalSanctionedAmount as projSanc, p.totalReleasedAmount as projRel, p.projectEndDate as projEnd
+        FROM budget_requests r
+        JOIN projects p ON r.projectId = p.id
+        WHERE r.id = ?
+    ");
+    $stmt->execute([$requestId]);
+    $req = $stmt->fetch();
 
-    if (!$req) {
-        echo json_encode(['success' => false, 'message' => 'Request not found']); exit();
-    }
-    if ((string)($req['status'] ?? '') !== 'approved') {
-        echo json_encode(['success' => false, 'message' => 'Certificate only available for approved requests']); exit();
-    }
+    if (!$req) throw new Exception('Request not found');
+    if ($req['status'] !== 'approved') throw new Exception('Certificate only available for approved requests');
 
-    // ── Fetch linked project ──────────────────────────────────────────────────
-    $project = null;
-    if (!empty($req['projectId'])) {
-        try {
-            $project = $db->projects->findOne([
-                '_id' => new MongoDB\BSON\ObjectId((string)$req['projectId'])
-            ]);
-        } catch (Exception $e) { /* project fetch optional */ }
-    }
+    // 2. Fetch history to find approval date (Director or DR)
+    $stmtH = $db->prepare("
+        SELECT timestamp, stage 
+        FROM approval_history 
+        WHERE requestId = ? AND action = 'approved' AND stage IN ('director', 'dr')
+        ORDER BY timestamp DESC LIMIT 1
+    ");
+    $stmtH->execute([$requestId]);
+    $h = $stmtH->fetch();
 
-    // ── Find approval date from history ──────────────────────────────────────
-    // The "final" approval is director (>25k chain) or dr (≤25k chain).
-    $approvedDate  = '';
-    $approvedByRole = '';
-    $history = isset($req['approvalHistory']) ? iterator_to_array($req['approvalHistory']) : [];
-    foreach (array_reverse($history) as $h) {
-        $action = (string)($h['action'] ?? '');
-        $stage  = (string)($h['stage']  ?? '');
-        if ($action === 'approved' && in_array($stage, ['director', 'dr'])) {
-            $approvedDate   = fmtDate($h['timestamp'] ?? '');
-            $approvedByRole = $stage;
-            break;
-        }
-    }
-    // Fallback: updatedAt
-    if (!$approvedDate && !empty($req['updatedAt'])) {
-        $approvedDate = fmtDate($req['updatedAt']);
-    }
-
-    // ── Core amounts ─────────────────────────────────────────────────────────
-    $amount = floatval($req['requestedAmount'] ?? $req['amount'] ?? 0);
-
-    // ── fileNumber: ALWAYS use what's stored on the request ──────────────────
-    // This is updated by resolve-query.php when PI re-uploads with a new file number.
-    $fileNumber = (string)($req['fileNumber'] ?? '');
-
-    // ── Project end date ─────────────────────────────────────────────────────
-    $projectEndDate = '';
-    if ($project) {
-        foreach (['projectEndDate','endDate','completionDate'] as $f) {
-            if (!empty($project[$f])) { $projectEndDate = fmtDate($project[$f]); break; }
-        }
-    }
-
-    // ── Mode of procurement fallback ─────────────────────────────────────────
-    $mode = (string)($req['mode'] ?? '');
-    if (!$mode) {
-        $mode = 'Through Direct Purchase on GeM portal under GFR 2017 rule (149-I).';
-    }
-
-    // ── Availability of funds fallback ───────────────────────────────────────
-    $expenditure = (string)($req['expenditure'] ?? '');
-    if (!$expenditure) {
-        $gpNum   = (string)($req['gpNumber'] ?? '');
-        $headN   = (string)($req['headName'] ?? '');
-        $headT   = (string)($req['headType'] ?? '');
-        $expenditure = "Yes, as per IFMS Budget-ID/{$gpNum} dated {$approvedDate}"
-                     . ($headN ? " under Head \"{$headN}" . ($headT ? " ({$headT})" : '') . '"' : '');
+    $approvedDate = $h ? fmtDate($h['timestamp']) : fmtDate($req['updatedAt']);
+    
+    // 3. Fallbacks
+    $amount = floatval($req['requestedAmount']);
+    $mode = $req['mode'] ?: 'Through Direct Purchase on GeM portal under GFR 2017 rule (149-I).';
+    
+    $expenditure = "Yes, as per IFMS Budget-ID/{$req['gpNumber']} dated {$approvedDate}";
+    if ($req['headName']) {
+        $expenditure .= " under Head \"{$req['headName']}" . ($req['headType'] ? " ({$req['headType']})" : '') . '"';
     }
 
     echo json_encode([
         'success' => true,
         'data'    => [
-            // ── Identifiers ─────────────────────────────────────────────────
-            'requestId'      => (string)$req['_id'],
-            'requestNumber'  => (string)($req['requestNumber'] ?? ''),
-
-            // ✅ Always the most up-to-date file number (updated on re-upload)
-            'fileNumber'     => $fileNumber,
+            'requestId'      => $req['id'],
+            'requestNumber'  => $req['requestNumber'],
+            'fileNumber'     => $req['fileNumber'],
             'approvedDate'   => $approvedDate,
-
-            // ── Row 1: Project ───────────────────────────────────────────────
-            'projectTitle'   => (string)($req['projectTitle'] ?? ''),
-            'projectType'    => (string)($req['projectType']  ?? ''),
-            'gpNumber'       => (string)($req['gpNumber']     ?? ''),
-
-            // ── Row 2: PI & Department ───────────────────────────────────────
-            'piName'         => (string)($req['piName']       ?? ''),
-            'piEmail'        => (string)($req['piEmail']      ?? ''),
-            'department'     => (string)($req['department']   ?? ''),
-
-            // ── Row 3: Completion date ───────────────────────────────────────
-            'projectEndDate' => $projectEndDate,
-
-            // ── Row 4: Total project cost ────────────────────────────────────
-            'totalSanctionedAmount' => $project ? floatval($project['totalSanctionedAmount'] ?? 0) : 0,
-            'totalReleasedAmount'   => $project ? floatval($project['totalReleasedAmount']   ?? 0) : 0,
-
-            // ── Row 5: Material (filled at BookBudget) ───────────────────────
-            'material'       => (string)($req['material']     ?? ''),
-            'headName'       => (string)($req['headName']     ?? ''),
-            'headType'       => (string)($req['headType']     ?? ''),
-
-            // ── Row 6: Amount (filled at BookBudget) ─────────────────────────
+            'projectTitle'   => $req['projectTitle'],
+            'projectType'    => $req['projectType'],
+            'gpNumber'       => $req['gpNumber'],
+            'piName'         => $req['piName'],
+            'piEmail'        => $req['piEmail'],
+            'department'     => $req['department'],
+            'projectEndDate' => fmtDate($req['projEnd']),
+            'totalSanctionedAmount' => floatval($req['projSanc']),
+            'totalReleasedAmount'   => floatval($req['projRel']),
+            'material'       => $req['material'],
+            'headName'       => $req['headName'],
+            'headType'       => $req['headType'],
             'amount'         => $amount,
             'amountWords'    => numberToWords($amount),
-
-            // ── Row 7: Availability of funds (filled at BookBudget) ──────────
             'expenditure'    => $expenditure,
-
-            // ── Row 8: Mode of procurement (filled at BookBudget) ────────────
             'mode'           => $mode,
-
-            // ── Row 9: Special remarks ───────────────────────────────────────
-            'purpose'        => (string)($req['purpose']      ?? ''),
-            'description'    => (string)($req['description']  ?? ''),
-
-            // ── Invoice / quotation ──────────────────────────────────────────
-            'invoiceNumber'  => (string)($req['invoiceNumber'] ?? ''),
-
-            // ── Reviewer remarks (for special remarks section) ───────────────
-            'daRemarks'      => (string)($req['daRemarks']     ?? ''),
-            'arRemarks'      => (string)($req['arRemarks']     ?? ''),
-            'drRemarks'      => (string)($req['drRemarks']     ?? ''),
-            'approvalType'   => (string)($req['approvalType']  ?? ''),
-        ],
+            'purpose'        => $req['purpose'],
+            'description'    => $req['description'],
+            'invoiceNumber'  => $req['invoiceNumber'],
+            'daRemarks'      => $req['daRemarks'],
+            'arRemarks'      => $req['arRemarks'],
+            'drRemarks'      => $req['drRemarks'],
+            'approvalType'   => $req['approvalType'],
+        ]
     ]);
 
 } catch (Exception $e) {

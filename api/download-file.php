@@ -11,38 +11,29 @@
 
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, OPTIONS');
-header('Access-Control-Allow-Headers: Content-Type, Authorization');
+require_once __DIR__ . '/../config/database.php';
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit(); }
 
-require_once __DIR__ . '/../config/database.php';
-$db = getMongoDBConnection();
+try {
+    $db = getMySQLConnection();
 
-$requestId = $_GET['requestId'] ?? '';
-$type      = $_GET['type']      ?? '';
+    $requestId = $_GET['requestId'] ?? '';
+    $type      = $_GET['type']      ?? '';
 
-// ── Route A: Quotation from budget_requests ───────────────────────────────────
-if ($requestId && $type === 'quotation') {
-    try {
-        $req = $db->budget_requests->findOne([
-            '_id' => new MongoDB\BSON\ObjectId($requestId)
-        ]);
+    // ── Route A: Quotation from budget_requests (Base64) ───────────────────────
+    if ($requestId && $type === 'quotation') {
+        $stmt = $db->prepare("SELECT quotation, quotationFileName, gpNumber, fileNumber, invoiceNumber FROM budget_requests WHERE id = ?");
+        $stmt->execute([$requestId]);
+        $req = $stmt->fetch();
 
-        if (!$req) {
-            header('Content-Type: application/json');
-            echo json_encode(['success' => false, 'message' => 'Request not found']);
-            exit();
-        }
+        if (!$req) throw new Exception('Request not found');
 
         $quotationRaw = (string)($req['quotation'] ?? '');
-
         if (empty($quotationRaw)) {
-            header('Content-Type: application/json');
-            echo json_encode(['success' => false, 'message' => 'No quotation file found for this request. Note: only requests submitted after the latest update will have the file stored.']);
-            exit();
+            throw new Exception('No quotation file found. Note: only requests submitted after the latest update will have the file stored.');
         }
 
-        // Strip data URL prefix: "data:application/pdf;base64,<data>"
         $base64 = $quotationRaw;
         if (strpos($quotationRaw, 'base64,') !== false) {
             $base64 = explode('base64,', $quotationRaw, 2)[1];
@@ -51,16 +42,13 @@ if ($requestId && $type === 'quotation') {
         $pdfBytes = base64_decode($base64, true);
 
         if ($pdfBytes === false || strlen($pdfBytes) === 0) {
-            header('Content-Type: application/json');
-            echo json_encode(['success' => false, 'message' => 'Failed to decode quotation file']);
-            exit();
+            throw new Exception('Failed to decode quotation file');
         }
 
-        // Build a descriptive filename
-        $fn  = (string)($req['quotationFileName'] ?? '');
+        $fn = (string)($req['quotationFileName'] ?? '');
         if (empty($fn)) {
-            $gp  = preg_replace('/[^a-zA-Z0-9_-]/', '_', (string)($req['gpNumber']      ?? 'GP'));
-            $fno = preg_replace('/[^a-zA-Z0-9_-]/', '_', (string)($req['fileNumber']    ?? ''));
+            $gp  = preg_replace('/[^a-zA-Z0-9_-]/', '_', (string)($req['gpNumber'] ?? 'GP'));
+            $fno = preg_replace('/[^a-zA-Z0-9_-]/', '_', (string)($req['fileNumber'] ?? ''));
             $inv = preg_replace('/[^a-zA-Z0-9_-]/', '_', (string)($req['invoiceNumber'] ?? ''));
             $fn  = "Quotation_{$gp}";
             if ($fno) $fn .= "_{$fno}";
@@ -74,34 +62,26 @@ if ($requestId && $type === 'quotation') {
         header('Cache-Control: no-cache, no-store, must-revalidate');
         echo $pdfBytes;
         exit();
-
-    } catch (Exception $e) {
-        header('Content-Type: application/json');
-        echo json_encode(['success' => false, 'message' => $e->getMessage()]);
-        exit();
     }
-}
 
-// ── Route B: Sanction letters from project_files (original behaviour) ─────────
-$filesCollection = $db->project_files;
-
-try {
+    // ── Route B: Sanction letters from project_files (Disk) ────────────────────
     $fileId    = $_GET['id']        ?? null;
     $projectId = $_GET['projectId'] ?? null;
     $gpNumber  = $_GET['gpNumber']  ?? null;
 
+    $file = null;
     if ($fileId) {
-        $file = $filesCollection->findOne(['_id' => new MongoDB\BSON\ObjectId($fileId)]);
+        $stmt = $db->prepare("SELECT * FROM project_files WHERE id = ?");
+        $stmt->execute([$fileId]);
+        $file = $stmt->fetch();
     } elseif ($projectId) {
-        $file = $filesCollection->findOne(
-            ['projectId' => $projectId, 'fileType' => 'sanction_letter'],
-            ['sort' => ['uploadedAt' => -1]]
-        );
+        $stmt = $db->prepare("SELECT * FROM project_files WHERE projectId = ? AND fileType = 'sanction_letter' ORDER BY uploadedAt DESC LIMIT 1");
+        $stmt->execute([$projectId]);
+        $file = $stmt->fetch();
     } elseif ($gpNumber) {
-        $file = $filesCollection->findOne(
-            ['gpNumber' => $gpNumber, 'fileType' => 'sanction_letter'],
-            ['sort' => ['uploadedAt' => -1]]
-        );
+        $stmt = $db->prepare("SELECT * FROM project_files WHERE gpNumber = ? AND fileType = 'sanction_letter' ORDER BY uploadedAt DESC LIMIT 1");
+        $stmt->execute([$gpNumber]);
+        $file = $stmt->fetch();
     } else {
         throw new Exception('Provide requestId+type=quotation, or id/projectId/gpNumber');
     }
@@ -125,4 +105,4 @@ try {
     header('Content-Type: application/json');
     echo json_encode(['success' => false, 'message' => $e->getMessage()]);
 }
-?>
+?>?>

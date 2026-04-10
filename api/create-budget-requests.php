@@ -24,7 +24,7 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     echo json_encode(['success' => false, 'message' => 'Method not allowed']); exit();
 }
 
-// ── Parse request (multipart fast path or legacy JSON) ────────────────
+// ── Parse request ────────────────
 $contentType = $_SERVER['CONTENT_TYPE'] ?? '';
 $isMultipart = str_contains($contentType, 'multipart/form-data');
 
@@ -57,15 +57,11 @@ if ($isMultipart) {
     if ($uploadedFile['type'] !== 'application/pdf') {
         echo json_encode(['success' => false, 'message' => 'Only PDF files are allowed']); exit();
     }
-    if ($uploadedFile['size'] > 10 * 1024 * 1024) {
-        echo json_encode(['success' => false, 'message' => 'File must be less than 10 MB']); exit();
-    }
     $quotationBytes = file_get_contents($uploadedFile['tmp_name']);
     $quotation      = 'data:application/pdf;base64,' . base64_encode($quotationBytes);
     $quotationName  = $uploadedFile['name'];
 
 } else {
-    // Legacy JSON path
     $input = json_decode(file_get_contents('php://input'), true);
     if (!$input) {
         echo json_encode(['success' => false, 'message' => 'Invalid JSON']); exit();
@@ -93,253 +89,125 @@ if ($isMultipart) {
     $quotationName         = $input['quotationName'] ?? '';
 }
 
-// ── Basic validation ──────────────────────────────────────────────────
+// ── Validation ────────────────
 if (!$projectId || !$gpNumber || !$piEmail || !$headId || !$headName) {
     echo json_encode(['success' => false, 'message' => 'Missing required fields (projectId, gpNumber, piEmail, headId, headName)']); exit();
 }
 if ($amount <= 0) {
     echo json_encode(['success' => false, 'message' => 'Amount must be greater than zero']); exit();
 }
-if (!$purpose || !$description || !$material || !$mode || !$invoiceNumber) {
-    echo json_encode(['success' => false, 'message' => 'Missing required fields (purpose, description, material, mode, invoiceNumber)']); exit();
-}
 if (!$quotation) {
     echo json_encode(['success' => false, 'message' => 'Quotation PDF is required']); exit();
 }
 
 try {
-    $db  = getMongoDBConnection();
-    $now = new MongoDB\BSON\UTCDateTime();
+    $db = getMySQLConnection();
 
-    // ── 1. Load project ───────────────────────────────────────────────
-    try { $projectObjId = new MongoDB\BSON\ObjectId($projectId); }
-    catch (Exception $e) { echo json_encode(['success' => false, 'message' => 'Invalid projectId format']); exit(); }
+    // ── 1. Load project ────────────────
+    $stmt = $db->prepare("SELECT * FROM projects WHERE id = ?");
+    $stmt->execute([$projectId]);
+    $project = $stmt->fetch();
 
-    $project = $db->projects->findOne(['_id' => $projectObjId]);
     if (!$project) {
         echo json_encode(['success' => false, 'message' => 'Project not found']); exit();
     }
-    if (in_array($project['status'] ?? '', ['rejected', 'completed'])) {
+    if (in_array($project['status'], ['rejected', 'completed'])) {
         echo json_encode(['success' => false, 'message' => 'Project is not active']); exit();
     }
 
-    $projectReleased = floatval($project['totalReleasedAmount'] ?? 0);
+    $projectReleased = floatval($project['totalReleasedAmount']);
     if ($projectReleased <= 0) {
         echo json_encode(['success' => false, 'message' => 'No funds have been released for this project yet']); exit();
     }
 
-    // ── 2. Live project-level booked (excludes rejected) ─────────────
-    // RULE: booked = SUM(requestedAmount) WHERE status != 'rejected'
-    // This means pending + in-stage + approved requests all count.
-    // Rejected requests are excluded → their amount is freed up again.
-    $projectBookingAgg = $db->budget_requests->aggregate([
-        ['$match' => [
-            'projectId' => $projectId,
-            'status'    => ['$ne' => 'rejected'],
-        ]],
-        ['$group' => ['_id' => null, 'booked' => ['$sum' => '$requestedAmount']]],
-    ]);
-    $projectBookingRow = iterator_to_array($projectBookingAgg);
-    $projectBooked     = floatval($projectBookingRow[0]['booked'] ?? 0);
-    $projectAvailable  = max(0.0, $projectReleased - $projectBooked);
+    // ── 2. Calculate Project level booked ────────────────
+    $bookedStmt = $db->prepare("SELECT SUM(requestedAmount) as booked FROM budget_requests WHERE projectId = ? AND status != 'rejected'");
+    $bookedStmt->execute([$projectId]);
+    $projectBooked = floatval($bookedStmt->fetch()['booked'] ?? 0);
+    $projectAvailable = max(0.0, $projectReleased - $projectBooked);
 
     if ($amount > $projectAvailable) {
         echo json_encode([
             'success' => false,
-            'message' => sprintf(
-                'Amount ₹%.2f exceeds project available balance ₹%.2f '
-                . '(Released: ₹%.2f, Currently booked: ₹%.2f). '
-                . 'Rejected requests are excluded and can be re-submitted.',
-                $amount, $projectAvailable, $projectReleased, $projectBooked
-            ),
-            'balances' => [
-                'projectReleased'  => $projectReleased,
-                'projectBooked'    => $projectBooked,
-                'projectAvailable' => $projectAvailable,
-                'requested'        => $amount,
-            ],
+            'message' => sprintf('Amount ₹%.2f exceeds project available balance ₹%.2f', $amount, $projectAvailable)
         ]); exit();
     }
 
-    // ── 3. Load head allocation (3-level fallback) ────────────────────
-    $headAlloc   = null;
-    $pidOrFilter = ['$or' => [['projectId' => $projectId], ['projectId' => $projectObjId]]];
-
-    try {
-        $headObjId = new MongoDB\BSON\ObjectId($headId);
-        $headAlloc = $db->head_allocations->findOne(array_merge(['_id' => $headObjId], $pidOrFilter));
-    } catch (Exception $e) {}
-
-    if (!$headAlloc && $headId !== '') {
-        $headAlloc = $db->head_allocations->findOne(array_merge(['headId' => $headId], $pidOrFilter));
-    }
-    if (!$headAlloc && $headName !== '') {
-        $headAlloc = $db->head_allocations->findOne(array_merge(
-            ['headName' => new MongoDB\BSON\Regex('^' . preg_quote(trim($headName), '/') . '$', 'i')],
-            $pidOrFilter
-        ));
-    }
+    // ── 3. Load Head Allocation ────────────────
+    // Fallback search: by ID then by HeadId then by Name
+    $headStmt = $db->prepare("SELECT * FROM head_allocations WHERE projectId = ? AND (id = ? OR headId = ? OR headName = ?)");
+    $headStmt->execute([$projectId, $headId, $headId, $headName]);
+    $headAlloc = $headStmt->fetch();
 
     if (!$headAlloc) {
-        $availableCursor = $db->head_allocations->find($pidOrFilter, ['projection' => ['headId' => 1, 'headName' => 1, '_id' => 1]]);
-        $availableNames  = [];
-        foreach ($availableCursor as $h) {
-            $availableNames[] = ($h['headName'] ?? '(no name)') . ' [_id:' . (string)($h['_id']) . ', headId:' . ($h['headId'] ?? 'n/a') . ']';
-        }
-        echo json_encode([
-            'success' => false,
-            'message' => "Budget head '{$headName}' not found for this project",
-            '_debug'  => ['searchedProjectId' => $projectId, 'searchedHeadId' => $headId, 'searchedHeadName' => $headName, 'availableHeadsInDB' => $availableNames],
-        ]); exit();
+        echo json_encode(['success' => false, 'message' => "Budget head '{$headName}' not found for this project"]); exit();
     }
 
-    $headReleased = floatval($headAlloc['releasedAmount'] ?? 0);
+    $headReleased = floatval($headAlloc['releasedAmount']);
     if ($headReleased <= 0) {
         echo json_encode(['success' => false, 'message' => "No funds released under head '{$headName}'"]); exit();
     }
 
-    $canonicalHeadId   = (string)($headAlloc['headId']   ?? $headId);
-    $canonicalHeadName = (string)($headAlloc['headName'] ?? $headName);
-
-    // ── 4. Live head-level booked (excludes rejected) ─────────────────
-    // Same rule as project level — rejected requests freed up, everything else counts.
-    $headBookingAgg = $db->budget_requests->aggregate([
-        ['$match' => [
-            'projectId' => $projectId,
-            'status'    => ['$ne' => 'rejected'],
-            '$or'       => [
-                ['headId'   => $headId],
-                ['headId'   => $canonicalHeadId],
-                ['headName' => $headName],
-                ['headName' => $canonicalHeadName],
-            ],
-        ]],
-        ['$group' => ['_id' => null, 'booked' => ['$sum' => '$requestedAmount']]],
-    ]);
-    $headBookingRow = iterator_to_array($headBookingAgg);
-    $headBooked     = floatval($headBookingRow[0]['booked'] ?? 0);
-    $headAvailable  = max(0.0, $headReleased - $headBooked);
+    // ── 4. Calculate Head level booked ────────────────
+    $hBookedStmt = $db->prepare("SELECT SUM(requestedAmount) as booked FROM budget_requests WHERE projectId = ? AND (headId = ? OR headName = ?) AND status != 'rejected'");
+    $hBookedStmt->execute([$projectId, $headAlloc['headId'], $headAlloc['headName']]);
+    $headBooked = floatval($hBookedStmt->fetch()['booked'] ?? 0);
+    $headAvailable = max(0.0, $headReleased - $headBooked);
 
     if ($amount > $headAvailable) {
         echo json_encode([
             'success' => false,
-            'message' => sprintf(
-                'Amount ₹%.2f exceeds head "%s" available balance ₹%.2f '
-                . '(Released: ₹%.2f, Currently booked: ₹%.2f). '
-                . 'Rejected requests are excluded and can be re-submitted.',
-                $amount, $canonicalHeadName, $headAvailable, $headReleased, $headBooked
-            ),
-            'balances' => [
-                'headReleased'  => $headReleased,
-                'headBooked'    => $headBooked,
-                'headAvailable' => $headAvailable,
-                'requested'     => $amount,
-            ],
+            'message' => sprintf('Amount ₹%.2f exceeds head "%s" available balance ₹%.2f', $amount, $headAlloc['headName'], $headAvailable)
         ]); exit();
     }
 
-    // ── 5. Generate unique request number ─────────────────────────────
-    $count         = $db->budget_requests->countDocuments([]);
+    // ── 5. Insert Request ────────────────
+    $db->beginTransaction();
+
+    $newRequestId = bin2hex(random_bytes(12)); // 24-char hex
+    $stmtCount = $db->query("SELECT COUNT(*) FROM budget_requests");
+    $count = $stmtCount->fetchColumn();
     $requestNumber = 'BR/' . date('Y') . '/' . str_pad($count + 1, 4, '0', STR_PAD_LEFT);
+    $now = date('Y-m-d H:i:s');
 
-    // ── 6. Insert request document ────────────────────────────────────
-    $requestDoc = [
-        'requestNumber'            => $requestNumber,
-        'projectId'                => $projectId,
-        'gpNumber'                 => $gpNumber,
-        'fileNumber'               => $fileNumber,
-        'projectTitle'             => $projectTitle,
-        'projectType'              => $projectType,
-        'piName'                   => $piName,
-        'piEmail'                  => $piEmail,
-        'department'               => $department,
-        'headId'                   => $canonicalHeadId,
-        'headName'                 => $canonicalHeadName,
-        'headType'                 => $headType ?: (string)($headAlloc['headType'] ?? ''),
-        'requestedAmount'          => $amount,
-        'actualExpenditure'        => 0,
+    $sql = "INSERT INTO budget_requests (
+                id, requestNumber, projectId, gpNumber, fileNumber, projectTitle, projectType, piName, piEmail, department,
+                headId, headName, headType, requestedAmount, purpose, description, material, mode, invoiceNumber,
+                projectCompletionDate, quotation, quotationFileName, snapshotProjectReleased, snapshotProjectBooked,
+                snapshotProjectAvailable, snapshotHeadReleased, snapshotHeadBooked, snapshotHeadAvailable,
+                status, currentStage, createdAt, updatedAt
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'da', ?, ?)";
+    
+    $stmt = $db->prepare($sql);
+    $stmt->execute([
+        $newRequestId, $requestNumber, $projectId, $gpNumber, $fileNumber, $projectTitle, $projectType, $piName, $piEmail, $department,
+        $headAlloc['headId'], $headAlloc['headName'], $headType ?: $headAlloc['headType'], $amount, $purpose, $description, $material, $mode, $invoiceNumber,
+        $projectCompletionDate, $quotation, $quotationName, $projectReleased, $projectBooked,
+        $projectAvailable, $headReleased, $headBooked, $headAvailable,
+        $now, $now
+    ]);
 
-        // Audit snapshot at submission time
-        'snapshotProjectReleased'  => $projectReleased,
-        'snapshotProjectBooked'    => $projectBooked,
-        'snapshotProjectAvailable' => $projectAvailable,
-        'snapshotHeadReleased'     => $headReleased,
-        'snapshotHeadBooked'       => $headBooked,
-        'snapshotHeadAvailable'    => $headAvailable,
+    // Update denormalized booked amounts
+    $db->prepare("UPDATE projects SET amountBookedByPI = amountBookedByPI + ?, updatedAt = ? WHERE id = ?")->execute([$amount, $now, $projectId]);
+    $db->prepare("UPDATE head_allocations SET bookedAmount = bookedAmount + ?, updatedAt = ? WHERE id = ?")->execute([$amount, $now, $headAlloc['id']]);
 
-        'purpose'                  => $purpose,
-        'description'              => $description,
-        'material'                 => $material,
-        'mode'                     => $mode,
-        'invoiceNumber'            => $invoiceNumber,
-        'projectCompletionDate'    => $projectCompletionDate,
-        'quotation'                => $quotation,
-        'quotationFileName'        => $quotationName,
-
-        'status'                   => 'pending',
-        'currentStage'             => 'da',
-        'previousStatus'           => '',
-        'approvalHistory'          => [],
-        'hasOpenQuery'             => false,
-        'latestQuery'              => null,
-
-        'daRemarks'                => '',
-        'arRemarks'                => '',
-        'drRemarks'                => '',
-        'drcOfficeRemarks'         => '',
-        'drcRcRemarks'             => '',
-        'drcRemarks'               => '',
-        'directorRemarks'          => '',
-        'rejectedBy'               => '',
-        'rejectedAtStage'          => '',
-        'rejectedAtStageLabel'     => '',
-        'rejectionRemarks'         => '',
-
-        'createdAt'                => $now,
-        'updatedAt'                => $now,
-    ];
-
-    $result = $db->budget_requests->insertOne($requestDoc);
-    if (!$result->getInsertedId()) {
-        throw new Exception('Failed to insert budget request');
-    }
-
-    // ── 7. Sync denormalised booked amounts on project + head ─────────
-    // These are the new post-submission booked totals.
-    // get-pi-projects.php will recompute from aggregation on next load,
-    // but we sync now so other endpoints reading the denormalised field
-    // get a reasonably fresh value.
-    $newProjectBooked = $projectBooked + $amount;
-    $db->projects->updateOne(
-        ['_id' => $projectObjId],
-        ['$set' => ['amountBookedByPI' => $newProjectBooked, 'updatedAt' => $now]]
-    );
-
-    $newHeadBooked = $headBooked + $amount;
-    $db->head_allocations->updateOne(
-        ['_id' => $headAlloc['_id']],
-        ['$set' => ['bookedAmount' => $newHeadBooked, 'updatedAt' => $now]]
-    );
+    $db->commit();
 
     echo json_encode([
         'success' => true,
         'message' => 'Budget request created successfully',
         'data'    => [
-            'id'            => (string)$result->getInsertedId(),
+            'id' => $newRequestId,
             'requestNumber' => $requestNumber,
-            // Return updated balances so the frontend can patch its local state instantly
             'updatedBalances' => [
-                'projectReleased'  => $projectReleased,
-                'projectBooked'    => $newProjectBooked,
-                'projectAvailable' => max(0.0, $projectReleased - $newProjectBooked),
-                'headReleased'     => $headReleased,
-                'headBooked'       => $newHeadBooked,
-                'headAvailable'    => max(0.0, $headReleased - $newHeadBooked),
-            ],
-        ],
+                'projectAvailable' => max(0.0, $projectAvailable - $amount),
+                'headAvailable' => max(0.0, $headAvailable - $amount)
+            ]
+        ]
     ]);
 
 } catch (Exception $e) {
+    if (isset($db) && $db->inTransaction()) $db->rollBack();
     error_log('create-budget-requests error: ' . $e->getMessage());
     http_response_code(500);
     echo json_encode(['success' => false, 'message' => $e->getMessage()]);

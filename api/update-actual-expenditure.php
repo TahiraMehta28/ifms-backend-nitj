@@ -16,198 +16,94 @@
  *   (unused booking is returned to the available pool)
  *
  * Accepts:
- *   { requestId,  actualExpenditure }  ← per-request (DA dashboard, preferred)
- *   { projectId,  actualExpenditure }  ← legacy project-level
+ *   { requestId,  actual_exp }  ← per-request (DA dashboard, preferred)
+ *   { projectId,  actual_exp }  ← legacy project-level
  */
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: POST, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, Authorization');
 header('Content-Type: application/json');
 
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit(); }
-
 require_once __DIR__ . '/../config/database.php';
+require_once __DIR__ . '/../models/Project.php';
+
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit(); }
 
 $input             = json_decode(file_get_contents('php://input'), true);
 $requestId         = trim($input['requestId']   ?? '');
 $projectId         = trim($input['projectId']   ?? '');
-$actualExpenditure = $input['actualExpenditure'] ?? null;
+$actual_exp = $input['actual_exp'] ?? $input['actualExpenditure'] ?? null;
 
-if ($actualExpenditure === null || $actualExpenditure === '') {
+if ($actual_exp === null || $actual_exp === '') {
     http_response_code(400);
-    echo json_encode(['success' => false, 'message' => 'actualExpenditure is required']);
+    echo json_encode(['success' => false, 'message' => 'actual_exp is required']);
     exit();
 }
-$actualExpenditure = floatval($actualExpenditure);
-if ($actualExpenditure < 0) {
+$actual_exp = floatval($actual_exp);
+if ($actual_exp < 0) {
     http_response_code(400);
-    echo json_encode(['success' => false, 'message' => 'actualExpenditure cannot be negative']);
+    echo json_encode(['success' => false, 'message' => 'actual_exp cannot be negative']);
     exit();
 }
 
 try {
-    $db  = getMongoDBConnection();
-    $now = new MongoDB\BSON\UTCDateTime();
+    $db = getMySQLConnection();
+    $now = date('Y-m-d H:i:s');
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Helper: re-aggregate booked (requestedAmount) and actual from
-    // budget_requests, then sync both fields back onto the project document.
-    // Tries string projectId first, then ObjectId, to handle both storage formats.
-    // ─────────────────────────────────────────────────────────────────────
-    function syncProjectFinancials($db, $projectId, $now): array {
-        $tryIds = [$projectId];
-        try { $tryIds[] = new MongoDB\BSON\ObjectId($projectId); } catch (Exception $e) {}
 
-        $bookedTotal = 0;
-        $actualTotal = 0;
+    $db->beginTransaction();
 
-        foreach ($tryIds as $pid) {
-            // Sum requestedAmount (canonical) with fallback to amount (legacy)
-            // We use $ifNull so legacy docs that stored 'amount' are included.
-            $bookedAgg = iterator_to_array($db->budget_requests->aggregate([
-                ['$match' => ['projectId' => $pid, 'status' => ['$nin' => ['rejected']]]],
-                ['$group' => [
-                    '_id'   => null,
-                    'total' => ['$sum' => [
-                        '$ifNull' => ['$requestedAmount', ['$ifNull' => ['$amount', 0]]]
-                    ]],
-                ]],
-            ]));
-            if (!empty($bookedAgg)) {
-                $bookedTotal = floatval($bookedAgg[0]['total']);
-            }
-
-            $actualAgg = iterator_to_array($db->budget_requests->aggregate([
-                ['$match' => [
-                    'projectId'        => $pid,
-                    'status'           => 'approved',
-                    'actualExpenditure' => ['$gt' => 0],
-                ]],
-                ['$group' => ['_id' => null, 'total' => ['$sum' => '$actualExpenditure']]],
-            ]));
-            if (!empty($actualAgg)) {
-                $actualTotal = floatval($actualAgg[0]['total']);
-            }
-
-            if ($bookedTotal > 0 || $actualTotal > 0) break; // found data, no need to retry with ObjectId
-        }
-
-        // Sync both fields — booked never resets to 0 now
-        $db->projects->updateOne(
-            ['_id' => new MongoDB\BSON\ObjectId($projectId)],
-            ['$set' => [
-                'amountBookedByPI'  => $bookedTotal,  // uses requestedAmount, not amount
-                'actualExpenditure' => $actualTotal,
-                'updatedAt'         => $now,
-            ]]
-        );
-
-        return ['booked' => $bookedTotal, 'actual' => $actualTotal];
-    }
-
-    /* ── PATH A: per-request update (DA dashboard) ──────────────────────── */
+    /* ── PATH A: Per-request update (Preferred) ─────────────────────────── */
     if ($requestId !== '') {
+        $stmtReq = $db->prepare("SELECT projectId, status, requestedAmount, headId, headName FROM budget_requests WHERE id = ? FOR UPDATE");
+        $stmtReq->execute([$requestId]);
+        $br = $stmtReq->fetch();
 
-        $br = $db->budget_requests->findOne(
-            ['_id' => new MongoDB\BSON\ObjectId($requestId)],
-            ['projection' => ['quotation' => 0]]
-        );
-        if (!$br) {
-            http_response_code(404);
-            echo json_encode(['success' => false, 'message' => 'Budget request not found']);
-            exit();
+        if (!$br) throw new Exception('Budget request not found');
+        if ($br['status'] !== 'approved') throw new Exception('Actual expenditure can only be entered for approved requests');
+
+        if ($projectId === '') $projectId = $br['projectId'];
+
+        // Validate individual request cap
+        if ($actual_exp > floatval($br['requestedAmount']) + 0.01) {
+            throw new Exception('Actual expenditure exceeds booked amount for this request');
         }
 
-        if (($br['status'] ?? '') !== 'approved') {
-            http_response_code(400);
-            echo json_encode([
-                'success' => false,
-                'message' => 'Actual expenditure can only be entered for fully approved requests',
-            ]);
-            exit();
-        }
+        // Update Request
+        $stmtUpd = $db->prepare("UPDATE budget_requests SET actual_exp = ?, actual_expEnteredBy = 'DA Officer', actual_expEnteredAt = ?, updatedAt = ? WHERE id = ?");
+        $stmtUpd->execute([$actual_exp, $now, $now, $requestId]);
 
-        // Resolve projectId
-        if ($projectId === '') $projectId = (string)($br['projectId'] ?? '');
-        if ($projectId === '') {
-            http_response_code(400);
-            echo json_encode(['success' => false, 'message' => 'Could not determine projectId']);
-            exit();
-        }
+        $projectModel = new Project($db);
+        $totals = $projectModel->syncFinancialTotals($projectId);
 
-        // Validate: actual must not exceed booked for this request
-        // Use requestedAmount as canonical; fall back to amount for legacy docs
-        $bookedForReq = floatval(
-            $br['requestedAmount'] ?? $br['amount'] ?? 0
-        );
-        if ($bookedForReq > 0 && $actualExpenditure > $bookedForReq) {
-            http_response_code(400);
-            echo json_encode([
-                'success' => false,
-                'message' => 'Actual expenditure (₹' . number_format($actualExpenditure, 2) .
-                             ') cannot exceed booked amount (₹' . number_format($bookedForReq, 2) . ')',
-            ]);
-            exit();
-        }
-
-        // Write actualExpenditure onto the budget_request document
-        $db->budget_requests->updateOne(
-            ['_id' => new MongoDB\BSON\ObjectId($requestId)],
-            ['$set' => [
-                'actualExpenditure'          => $actualExpenditure,
-                'actualExpenditureEnteredBy' => 'DA Officer',
-                'actualExpenditureEnteredAt' => $now,
-                'updatedAt'                  => $now,
-            ]]
-        );
-
-        // Re-sync project totals (booked stays correct now)
-        $totals = syncProjectFinancials($db, $projectId, $now);
-
+        $db->commit();
         echo json_encode([
             'success' => true,
-            'message' => 'Actual expenditure saved. Project totals re-synced.',
-            'data'    => [
-                'requestId'          => $requestId,
-                'projectId'          => $projectId,
-                'requestActual'      => $actualExpenditure,
-                'projectTotalBooked' => $totals['booked'],
-                'projectTotalActual' => $totals['actual'],
-                // Remaining = Released - Booked + (Booked - Actual)
-                // (computed at read-time from get-pi-projects.php; included here for reference)
-            ],
+            'message' => 'Expenditure saved and project totals synchronized.',
+            'data' => array_merge($totals, ['requestId' => $requestId, 'projectId' => $projectId])
         ]);
         exit();
     }
 
-    /* ── PATH B: legacy project-level update ────────────────────────────── */
-    if ($projectId === '') {
-        http_response_code(400);
-        echo json_encode(['success' => false, 'message' => 'Either requestId or projectId is required']);
-        exit();
-    }
+    /* ── PATH B: Legacy project-level update ────────────────────────────── */
+    if ($projectId === '') throw new Exception('Either requestId or projectId is required');
 
-    $result = $db->projects->updateOne(
-        ['_id' => new MongoDB\BSON\ObjectId($projectId)],
-        ['$set' => ['actualExpenditure' => $actualExpenditure, 'updatedAt' => $now]]
-    );
-    if ($result->getMatchedCount() === 0) {
-        http_response_code(404);
-        echo json_encode(['success' => false, 'message' => 'Project not found']);
-        exit();
-    }
+    $db->prepare("UPDATE projects SET actual_exp = ?, updatedAt = ? WHERE id = ?")
+       ->execute([$actual_exp, $now, $projectId]);
 
-    // Re-sync booked too so the legacy path also stays consistent
-    syncProjectFinancials($db, $projectId, $now);
+    $projectModel = new Project($db);
+    $projectModel->syncFinancialTotals($projectId);
 
+    $db->commit();
     echo json_encode([
         'success' => true,
         'message' => 'Actual expenditure updated (project level)',
-        'data'    => ['projectId' => $projectId, 'actualExpenditure' => $actualExpenditure],
+        'data' => ['projectId' => $projectId, 'actual_exp' => $actual_exp]
     ]);
 
 } catch (Exception $e) {
-    error_log('update-actual-expenditure v3: ' . $e->getMessage());
+    if (isset($db) && $db->inTransaction()) $db->rollBack();
+    error_log("update-actual-expenditure error: " . $e->getMessage() . " at " . $e->getFile() . ":" . $e->getLine());
     http_response_code(500);
     echo json_encode(['success' => false, 'message' => $e->getMessage()]);
 }

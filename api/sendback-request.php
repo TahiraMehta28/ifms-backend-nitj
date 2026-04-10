@@ -30,9 +30,14 @@ $requestId  = $input['requestId']  ?? '';
 $remarks    = trim($input['remarks'] ?? '');
 $sentBackBy = $input['sentBackBy'] ?? ''; // e.g. "AR", "DR", "DRC_OFFICE", "DRC_RC", "DRC", "DIRECTOR"
 
+if (!$requestId) {
+    echo json_encode(['success' => false, 'message' => 'requestId is required']); exit();
+}
+if (!$remarks) {
+    echo json_encode(['success' => false, 'message' => 'Remarks are required for sending back']); exit();
+}
+
 // ── Sendback map ──────────────────────────────────────────────────────────────
-// Key   = currentStage of the request right now (who is acting)
-// Value = [new status, new currentStage, history action label]
 const SENDBACK_MAP = [
     'ar'         => ['status' => 'sent_back_to_da',         'nextStage' => 'da',         'label' => 'Sent back to DA by AR'],
     'dr'         => ['status' => 'sent_back_to_ar',         'nextStage' => 'ar',         'label' => 'Sent back to AR by DR'],
@@ -42,39 +47,30 @@ const SENDBACK_MAP = [
     'director'   => ['status' => 'sent_back_to_drc',        'nextStage' => 'drc',        'label' => 'Sent back to DRC by Director'],
 ];
 
-if (!$requestId) {
-    echo json_encode(['success' => false, 'message' => 'requestId is required']); exit();
-}
-if (!$remarks) {
-    echo json_encode(['success' => false, 'message' => 'Remarks are required for sending back']); exit();
-}
-
 try {
-    $db  = getMongoDBConnection();
-    $req = $db->budget_requests->findOne(
-        ['_id' => new \MongoDB\BSON\ObjectId($requestId)],
-        ['projection' => ['quotation' => 0]]
-    );
+    $db = getMySQLConnection();
+    
+    // Fetch request metadata
+    $stmt = $db->prepare("SELECT status, currentStage FROM budget_requests WHERE id = ?");
+    $stmt->execute([$requestId]);
+    $req = $stmt->fetch();
 
     if (!$req) {
         echo json_encode(['success' => false, 'message' => 'Request not found']); exit();
     }
 
-    $currentStage = (string)($req['currentStage'] ?? '');
+    $currentStage  = strtolower((string)($req['currentStage'] ?? ''));
+    $currentStatus = (string)($req['status'] ?? '');
 
     if (!isset(SENDBACK_MAP[$currentStage])) {
+        $availableStages = implode(', ', array_keys(SENDBACK_MAP));
         echo json_encode([
             'success' => false,
-            'message' => "Sendback not allowed from stage: '{$currentStage}'. DA is the first stage and cannot send back.",
+            'message' => "Sendback not allowed from stage: '{$currentStage}'. DA is the first stage and cannot send back. Allowed stages: {$availableStages}",
         ]); exit();
     }
 
-    $map       = SENDBACK_MAP[$currentStage];
-    $newStatus = $map['status'];
-    $nextStage = $map['nextStage'];
-    $label     = $map['label'];
-
-    // ── Validate the request is actually actionable at this stage ─────────────
+    // ── Validate the request status ────────────────────────────
     $validStatuses = [
         'ar'         => ['da_approved',          'sent_back_to_ar'],
         'dr'         => ['ar_approved',           'sent_back_to_dr'],
@@ -84,26 +80,22 @@ try {
         'director'   => ['drc_forwarded',         'sent_back_to_director'],
     ];
 
-    $currentStatus = (string)($req['status'] ?? '');
     if (isset($validStatuses[$currentStage]) && !in_array($currentStatus, $validStatuses[$currentStage])) {
+        $allowed = implode(', ', $validStatuses[$currentStage]);
         echo json_encode([
             'success' => false,
-            'message' => "Cannot send back. Current status '{$currentStatus}' is not valid for sendback at stage '{$currentStage}'.",
+            'message' => "Cannot send back. Current status '{$currentStatus}' is not valid for sendback at stage '{$currentStage}'. Allowed statuses for this stage are: [{$allowed}]",
         ]); exit();
     }
 
-    $now     = new \MongoDB\BSON\UTCDateTime();
-    $history = isset($req['approvalHistory']) ? iterator_to_array($req['approvalHistory']) : [];
-    $history[] = [
-        'stage'     => $currentStage,
-        'action'    => 'sent_back',
-        'by'        => $sentBackBy ?: strtoupper($currentStage),
-        'timestamp' => date('c'),
-        'remarks'   => $remarks,
-        'label'     => $label,
-    ];
+    $map       = SENDBACK_MAP[$currentStage];
+    $newStatus = $map['status'];
+    $nextStage = $map['nextStage'];
+    $label     = $map['label'];
 
-    // Stage-specific remarks field
+    $db->beginTransaction();
+
+    $now = date('Y-m-d H:i:s');
     $remarksFieldMap = [
         'ar'         => 'arRemarks',
         'dr'         => 'drRemarks',
@@ -113,20 +105,25 @@ try {
         'director'   => 'directorRemarks',
     ];
     $remarksField = $remarksFieldMap[$currentStage] ?? ($currentStage . 'Remarks');
+    $byUser = $sentBackBy ?: strtoupper($currentStage);
 
-    $db->budget_requests->updateOne(
-        ['_id' => new \MongoDB\BSON\ObjectId($requestId)],
-        ['$set' => [
-            'status'          => $newStatus,
-            'previousStatus'  => $currentStatus,
-            'currentStage'    => $nextStage,
-            $remarksField     => $remarks,
-            'sentBackBy'      => $sentBackBy ?: strtoupper($currentStage),
-            'sentBackAt'      => $now,
-            'approvalHistory' => $history,
-            'updatedAt'       => $now,
-        ]]
-    );
+    // 1. Update request
+    $sql = "UPDATE budget_requests 
+            SET status = ?, 
+                previousStatus = ?, 
+                currentStage = ?, 
+                $remarksField = ?, 
+                updatedAt = ? 
+            WHERE id = ?";
+    $stmtUpdate = $db->prepare($sql);
+    $stmtUpdate->execute([$newStatus, $currentStatus, $nextStage, $remarks, $now, $requestId]);
+
+    // 2. Add to history
+    $sqlHist = "INSERT INTO approval_history (requestId, stage, action, `by`, remarks, timestamp) 
+                VALUES (?, ?, 'sent_back', ?, ?, ?)";
+    $db->prepare($sqlHist)->execute([$requestId, $currentStage, $byUser, $remarks, $now]);
+
+    $db->commit();
 
     echo json_encode([
         'success' => true,
@@ -139,6 +136,8 @@ try {
     ]);
 
 } catch (Exception $e) {
+    if (isset($db) && $db->inTransaction()) $db->rollBack();
+    error_log("sendback-request error: " . $e->getMessage());
     http_response_code(500);
     echo json_encode(['success' => false, 'message' => $e->getMessage()]);
 }

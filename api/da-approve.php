@@ -10,9 +10,6 @@ header('Content-Type: application/json');
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit(); }
 
-use MongoDB\BSON\ObjectId;
-use MongoDB\BSON\UTCDateTime;
-
 require_once __DIR__ . '/../config/database.php';
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
@@ -29,11 +26,12 @@ if (!$requestId) {
 }
 
 try {
-    $db  = getMongoDBConnection();
-    $req = $db->budget_requests->findOne(
-        ['_id' => new \MongoDB\BSON\ObjectId($requestId)],
-        ['projection' => ['quotation' => 0]]
-    );
+    $db = getMySQLConnection();
+
+    // 1. Fetch Request
+    $stmt = $db->prepare("SELECT * FROM budget_requests WHERE id = ?");
+    $stmt->execute([$requestId]);
+    $req = $stmt->fetch();
 
     if (!$req) {
         echo json_encode(['success' => false, 'message' => 'Request not found']); exit();
@@ -42,33 +40,31 @@ try {
         echo json_encode(['success' => false, 'message' => 'Request is not at DA stage']); exit();
     }
 
-    // Accept both fresh requests AND requests sent back from AR for re-processing
     $allowedStatuses = ['pending', 'sent_back_to_da'];
     if (!in_array($req['status'], $allowedStatuses)) {
         echo json_encode(['success' => false, 'message' => "Cannot process request with status: {$req['status']}"]); exit();
     }
 
-    $now     = new \MongoDB\BSON\UTCDateTime();
-    $history = isset($req['approvalHistory']) ? iterator_to_array($req['approvalHistory']) : [];
-    $history[] = [
-        'stage'     => 'da',
-        'action'    => 'approved',
-        'by'        => $approvedBy,
-        'timestamp' => date('c'),
-        'remarks'   => $remarks,
-    ];
+    $now = date('Y-m-d H:i:s');
+    $timestamp = date('c');
 
-    $db->budget_requests->updateOne(
-        ['_id' => new \MongoDB\BSON\ObjectId($requestId)],
-        ['$set' => [
-            'status'          => 'da_approved',
-            'currentStage'    => 'ar',
-            'daRemarks'       => $remarks,
-            'daApprovedAt'    => $now,
-            'approvalHistory' => $history,
-            'updatedAt'       => $now,
-        ]]
-    );
+    $db->beginTransaction();
+
+    // 2. Update Request
+    $updateStmt = $db->prepare("UPDATE budget_requests SET 
+                                 status = 'da_approved', 
+                                 currentStage = 'ar', 
+                                 daRemarks = ?, 
+                                 updatedAt = ? 
+                               WHERE id = ?");
+    $updateStmt->execute([$remarks, $now, $requestId]);
+
+    // 3. Insert History
+    $histStmt = $db->prepare("INSERT INTO approval_history (requestId, stage, action, `by`, timestamp, remarks) 
+                              VALUES (?, 'da', 'approved', ?, ?, ?)");
+    $histStmt->execute([$requestId, $approvedBy, $timestamp, $remarks]);
+
+    $db->commit();
 
     echo json_encode([
         'success' => true,
@@ -77,6 +73,7 @@ try {
     ]);
 
 } catch (Exception $e) {
+    if (isset($db) && $db->inTransaction()) $db->rollBack();
     http_response_code(500);
     echo json_encode(['success' => false, 'message' => $e->getMessage()]);
 }
